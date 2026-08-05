@@ -14777,7 +14777,7 @@ def handle_post(handler, parsed) -> bool:
                 # current chat every few seconds while the user is typing, and that
                 # delayed reload can restore an older draft over newer local input.
                 _draft_mark("before_save")
-                s.save(touch_updated_at=False, skip_index=True)
+                s.save_metadata({"composer_draft": next_draft})
                 _draft_mark("after_save")
                 saved_draft = s.composer_draft
         _draft_mark("released_lock")
