@@ -326,6 +326,17 @@ class WebUISqliteSessionDB:
         session["context_messages"] = self._read_context_messages(sid)
         return session
 
+    def read_metadata_only(self, sid: str) -> dict[str, Any] | None:
+        """Load only metadata fields; do not touch message/tool tables."""
+        if not _is_safe_session_id(sid):
+            return None
+        row = self._conn().execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (sid,)
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_metadata(dict(row), include_computed=False)
+
     def _read_messages(self, sid: str) -> list[dict[str, Any]]:
         cur = self._conn().execute(
             "SELECT message_json FROM messages WHERE session_id = ? ORDER BY idx", (sid,)

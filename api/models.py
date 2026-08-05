@@ -1703,13 +1703,11 @@ class Session:
         try:
             store = _get_sqlite_session_store()
             if store:
-                data = store.read_session(sid)
+                data = store.read_metadata_only(sid)
                 if data is not None:
-                    # Build a metadata-only session from the SQLite row.
-                    needed_meta = {k: v for k, v in data.items() if k not in ('messages', 'tool_calls', 'context_messages', 'anchor_activity_scenes')}
-                    needed_meta['messages'] = []
-                    needed_meta['tool_calls'] = []
-                    session = cls(**needed_meta)
+                    data['messages'] = []
+                    data['tool_calls'] = []
+                    session = cls(**data)
                     session._metadata_message_count = _parse_nonnegative_int(data.get('message_count'))
                     session._loaded_metadata_only = True
                     return session
