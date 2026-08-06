@@ -325,6 +325,14 @@ class WebUISqliteSessionDB:
         session["context_messages"] = self._read_context_messages(sid)
         return session
 
+    def session_exists(self, sid: str) -> bool:
+        if not _is_safe_session_id(sid):
+            return False
+        row = self._conn().execute(
+            "SELECT 1 FROM sessions WHERE session_id = ?", (sid,)
+        ).fetchone()
+        return row is not None
+
     def read_metadata_only(self, sid: str) -> dict[str, Any] | None:
         """Load only metadata fields; do not touch message/tool tables."""
         if not _is_safe_session_id(sid):

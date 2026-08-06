@@ -135,6 +135,43 @@ def test_session_load_falls_back_to_json_when_sqlite_misses_row(monkeypatch):
     assert len(s.messages) == 2
 
 
+def test_save_metadata_falls_back_to_json_for_unmigrated_session(monkeypatch):
+    """sessions.db exists but the session is JSON-only: draft autosave must
+    persist to the sidecar, not raise KeyError from a zero-row SQLite UPDATE."""
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+
+    sid = "sid-json-draft"
+    payload = _sample_session_dict(sid)
+    (d / f"{sid}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    # Activate the SQLite store without migrating this session.
+    _ = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+
+    s = models.Session.load(sid)
+    assert s is not None
+    s.save_metadata({"composer_draft": {"text": "json draft", "files": []}})
+
+    on_disk = json.loads((d / f"{sid}.json").read_text(encoding="utf-8"))
+    assert on_disk["composer_draft"]["text"] == "json draft"
+
+    reloaded = models.Session.load(sid)
+    assert reloaded.composer_draft["text"] == "json draft"
+    assert len(reloaded.messages) == 2
+
+
+def test_session_exists():
+    d = _tmp_session_dir()
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-exists"))
+
+    assert store.session_exists("sid-exists") is True
+    assert store.session_exists("sid-missing") is False
+    assert store.session_exists("../escape") is False
+
+
 def test_update_metadata_does_not_advance_updated_at_for_drafts():
     d = _tmp_session_dir()
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)

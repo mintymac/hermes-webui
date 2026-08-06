@@ -1412,7 +1412,13 @@ class Session:
         if not is_safe_session_id(self.session_id):
             raise ValueError(f"Unsafe session_id {self.session_id!r}")
         store = _get_sqlite_session_store()
-        if store:
+        # The store being active does not mean THIS session has a SQLite row:
+        # sessions.db can exist while an unmigrated session lives only in its
+        # JSON sidecar (Session.load() falls back to the sidecar). Routing
+        # such a session's draft autosave to SQLite updates zero rows and the
+        # follow-up lookup raises KeyError, losing the draft — so only take
+        # the SQLite path when the row is actually there.
+        if store and store.session_exists(self.session_id):
             # Apply in-memory first so the object stays consistent.
             for k, v in fields.items():
                 setattr(self, k, v)
