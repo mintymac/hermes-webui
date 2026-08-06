@@ -1,6 +1,7 @@
 """SQLite-backed session store regression tests."""
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -112,3 +113,50 @@ def test_session_save_metadata_sqlite_only(monkeypatch):
     reloaded = models.Session.load("sid-6")
     assert reloaded.composer_draft["text"] == "quick draft"
     assert len(reloaded.messages) == 2
+
+
+def test_session_load_falls_back_to_json_when_sqlite_misses_row(monkeypatch):
+    """If sessions.db exists but a session was not migrated, JSON sidecar is used."""
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+
+    # Create a JSON-only session.
+    sid = "sid-json-only"
+    payload = _sample_session_dict(sid)
+    (d / f"{sid}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    # Activating SQLite must not hide the JSON-only session.
+    _ = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    s = models.Session.load(sid)
+    assert s is not None
+    assert s.session_id == sid
+    assert len(s.messages) == 2
+
+
+def test_update_metadata_does_not_advance_updated_at_for_drafts():
+    d = _tmp_session_dir()
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-draft"))
+
+    loaded = store.read_session("sid-draft")
+    original_updated_at = loaded["updated_at"]
+
+    store.update_metadata("sid-draft", {"composer_draft": {"text": "draft", "files": []}})
+
+    reloaded = store.read_session("sid-draft")
+    assert reloaded["composer_draft"]["text"] == "draft"
+    assert reloaded["updated_at"] == original_updated_at
+
+
+def test_update_metadata_advances_updated_at_when_requested():
+    d = _tmp_session_dir()
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-touch"))
+
+    new_time = 9999.0
+    store.update_metadata("sid-touch", {"updated_at": new_time})
+
+    reloaded = store.read_session("sid-touch")
+    assert reloaded["updated_at"] == new_time

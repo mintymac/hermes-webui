@@ -20,8 +20,6 @@ from __future__ import annotations
 import copy
 import json
 import sqlite3
-import threading
-import time
 from pathlib import Path
 from typing import Any
 
@@ -409,8 +407,13 @@ class WebUISqliteSessionDB:
                 else:
                     set_parts.append(f"{k} = ?")
                     values.append(v)
-            set_parts.append("updated_at = ?")
-            values.append(time.time())
+            # Only bump updated_at when the caller explicitly provides it.
+            # Draft autosave calls save_metadata() without updated_at so that
+            # typing does not reorder the session in the sidebar or trigger
+            # activity-poll reloads.
+            if "updated_at" in fields:
+                set_parts.append("updated_at = ?")
+                values.append(fields["updated_at"])
             values.append(sid)
             conn.execute(
                 f"UPDATE sessions SET {', '.join(set_parts)} WHERE session_id = ?",

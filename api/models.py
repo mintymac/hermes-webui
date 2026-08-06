@@ -1643,7 +1643,8 @@ class Session:
             if data is not None:
                 data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
                 return cls(**data)
-            return None
+            # SQLite is active but this session has not been migrated yet;
+            # fall through to the JSON sidecar below.
         # ── JSON sidecar fallback ────────────────────────────────────────
         p = SESSION_DIR / f'{sid}.json'
         if not p.exists():
