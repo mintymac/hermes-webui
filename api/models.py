@@ -1447,6 +1447,14 @@ class Session:
         # JSON fallback: read, update, write back.
         data = json.loads(self.path.read_text(encoding="utf-8"))
         data.update(fields)
+        # Mirror the SQLite branch and keep the in-memory object consistent
+        # with what we just persisted. Without this the JSON path silently
+        # relies on the caller having pre-set every field (the draft route
+        # happens to do so, but save_metadata's contract should be
+        # self-contained so a caller that doesn't pre-set never reads stale
+        # state back).
+        for k, v in fields.items():
+            setattr(self, k, v)
         tmp = self.path.with_suffix(f".tmp.{os.getpid()}.{threading.current_thread().ident}")
         try:
             with open(tmp, "w", encoding="utf-8") as f:

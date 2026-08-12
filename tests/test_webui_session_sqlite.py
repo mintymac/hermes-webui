@@ -162,6 +162,44 @@ def test_save_metadata_falls_back_to_json_for_unmigrated_session(monkeypatch):
     assert len(reloaded.messages) == 2
 
 
+def test_save_metadata_json_fallback_updates_in_memory_session(monkeypatch):
+    """Greptile P1 (r3745331728): the JSON-fallback branch of save_metadata()
+    must keep the in-memory Session consistent with the sidecar it just wrote.
+
+    The draft route happens to pre-set ``s.composer_draft`` before calling
+    save_metadata(), which masks the asymmetry; this test exercises the method
+    directly without that pre-set, so it fails if the JSON branch forgets to
+    setattr the object (the original bug left ``s.composer_draft`` as ``{}``).
+    """
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+
+    sid = "sid-json-mem"
+    payload = _sample_session_dict(sid)
+    (d / f"{sid}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    # sessions.db exists but this session was not migrated into it.
+    _ = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+
+    s = models.Session.load(sid)
+    assert s is not None
+    assert s.composer_draft == {}
+
+    # Deliberately do NOT pre-set s.composer_draft: save_metadata() must own
+    # keeping the in-memory object consistent with the persisted sidecar.
+    s.save_metadata({"composer_draft": {"text": "mem draft", "files": []}})
+
+    # In-memory object must reflect the persisted draft (staleness would leave
+    # this as the original empty dict).
+    assert s.composer_draft == {"text": "mem draft", "files": []}
+
+    # And the sidecar on disk must match.
+    on_disk = json.loads((d / f"{sid}.json").read_text(encoding="utf-8"))
+    assert on_disk["composer_draft"]["text"] == "mem draft"
+
+
 def test_session_exists():
     d = _tmp_session_dir()
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
