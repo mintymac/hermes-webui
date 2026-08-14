@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
+from types import SimpleNamespace
 
 import api.models as models
 import api.webui_session_sqlite as sqlite_db
@@ -235,3 +237,111 @@ def test_update_metadata_advances_updated_at_when_requested():
 
     reloaded = store.read_session("sid-touch")
     assert reloaded["updated_at"] == new_time
+
+
+# ── Route-level regressions: POST /api/session/draft through the real
+# routes.handle_post dispatcher, the way the composer's 400ms debounced
+# auto-save actually reaches this code in production. The unit tests above
+# call save_metadata() directly; these prove the store ordering holds
+# end-to-end (dispatch → get_session → save_metadata → persistence). ──────
+
+
+def _patch_route_state(monkeypatch, d):
+    """Point models+routes session state at an isolated tmpdir."""
+    import api.routes as routes
+
+    sessions = OrderedDict()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", sessions)
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+    monkeypatch.setattr(routes, "SESSION_DIR", d)
+    monkeypatch.setattr(routes, "SESSIONS", sessions)
+
+
+def _drive_draft_post(monkeypatch, body):
+    """Run POST /api/session/draft through routes.handle_post (CSRF bypassed,
+    JSON responders captured) and return the captured response."""
+    import api.routes as routes
+
+    captured = {}
+    monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
+    monkeypatch.setattr(routes, "read_body", lambda handler: body)
+    monkeypatch.setattr(
+        routes,
+        "bad",
+        lambda handler, msg, status=400, extra_headers=None: captured.update(
+            error=msg, status=status
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda handler, payload, status=200, extra_headers=None, pretty=True: captured.update(
+            payload=payload, status=status
+        )
+        or True,
+    )
+    handler = SimpleNamespace(command="POST", _safe_webui_print=lambda *_a, **_k: None)
+    assert routes.handle_post(handler, SimpleNamespace(path="/api/session/draft")) is True
+    return captured
+
+
+def test_draft_route_sqlite_ordering_persists_to_migrated_row(monkeypatch):
+    """sessions.db active + session migrated: the draft autosave must update
+    only the SQLite sessions row — no JSON sidecar is created, the transcript
+    is untouched, and updated_at does not move (a keystroke is not activity)."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-route-sqlite"))
+
+    captured = _drive_draft_post(
+        monkeypatch,
+        {"session_id": "sid-route-sqlite", "text": "sqlite route draft", "files": []},
+    )
+
+    assert captured.get("status") == 200
+    assert captured["payload"]["ok"] is True
+    assert captured["payload"]["draft"]["text"] == "sqlite route draft"
+
+    row = store.read_session("sid-route-sqlite")
+    assert row["composer_draft"]["text"] == "sqlite route draft"
+    assert len(row["messages"]) == 2
+    assert row["updated_at"] == 1001.0
+    assert not (d / "sid-route-sqlite.json").exists()
+
+
+def test_draft_route_json_fallback_ordering_for_unmigrated_session(monkeypatch):
+    """Mixed-store ordering (the 3026ecb production failure): sessions.db
+    exists but this session was never migrated. Before the session_exists()
+    gate, save_metadata() routed the draft to SQLite, the UPDATE matched zero
+    rows, the follow-up lookup raised KeyError, and the draft was persisted
+    nowhere. The route must return ok and write the JSON sidecar."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+
+    sid = "sid-route-json-only"
+    (d / f"{sid}.json").write_text(json.dumps(_sample_session_dict(sid)), encoding="utf-8")
+    # Activate sessions.db WITHOUT migrating this session into it.
+    _ = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+
+    captured = _drive_draft_post(
+        monkeypatch, {"session_id": sid, "text": "json route draft", "files": []}
+    )
+
+    assert captured.get("status") == 200
+    assert captured["payload"]["ok"] is True
+    assert captured["payload"]["draft"]["text"] == "json route draft"
+
+    on_disk = json.loads((d / f"{sid}.json").read_text(encoding="utf-8"))
+    assert on_disk["composer_draft"]["text"] == "json route draft"
+    assert on_disk["updated_at"] == 1001.0
+    assert len(on_disk["messages"]) == 2
+
+    # A fresh load (cold cache, e.g. after restart) reads the draft back.
+    reloaded = models.Session.load(sid)
+    assert reloaded.composer_draft["text"] == "json route draft"
+    assert len(reloaded.messages) == 2
