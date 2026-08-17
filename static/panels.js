@@ -353,6 +353,32 @@ function _panelFromCurrentMainView(){
 }
 
 function _syncMobileSidebarPanelFromMainView(){
+  const mainEl=document.querySelector('main.main');
+  // Extension panels are intentionally outside MAIN_VIEW_PANELS: the host must
+  // not try to lazy-load or own their main view. They do, however, publish the
+  // visible view as `showing-x-<token>` and install a matching sidebar
+  // `.panel-view[data-panel-token]`. The mobile drawer is reopened through this
+  // sync helper, so treating that state as Chat deactivated the extension's
+  // sidebar view every time the operator opened the hamburger or edge drawer.
+  // The frame remained behind the drawer, but its content had no reachable
+  // navigation state on the phone.
+  const extensionClass=mainEl&&Array.from(mainEl.classList)
+    .find(name=>name.startsWith('showing-x-'));
+  const extensionToken=extensionClass&&extensionClass.slice('showing-x-'.length);
+  if(extensionToken){
+    const extensionView=Array.from(document.querySelectorAll('.sidebar .panel-view'))
+      .find(view=>view.dataset.panelToken===extensionToken);
+    if(extensionView){
+      const extensionPanel=`x-${extensionToken}`;
+      document.querySelectorAll('[data-panel]').forEach(t=>t.classList.toggle('active',t.dataset.panel===extensionPanel));
+      document.querySelectorAll('.panel-view').forEach(p=>p.classList.remove('active'));
+      extensionView.classList.add('active');
+      // Do not put an extension token in _currentPanel: switchPanel owns that
+      // state and only accepts its native panel names. Returning the token keeps
+      // this helper truthful without corrupting the host state machine.
+      return extensionPanel;
+    }
+  }
   const panel=_panelFromCurrentMainView();
   if(!panel)return _currentPanel||'chat';
   const panelEl=$('panel'+panel.charAt(0).toUpperCase()+panel.slice(1));
@@ -395,6 +421,18 @@ async function switchPanel(name, opts = {}) {
     if (typeof _kanbanStopPolling === 'function') _kanbanStopPolling();
   }
   _currentPanel = nextPanel;
+  // Mobile drawer visibility: a rail/tab click on a phone should surface the
+  // panel synchronously, NOT after the panel's async data load. If the re-open
+  // stayed at the bottom of this function, a form opened from inside the drawer
+  // (e.g. openWorkspaceCreate closing the drawer) would race the deferred
+  // re-open and the drawer would win, covering the main-view form.
+  if (opts.fromRailClick && typeof _isDesktopWidth === 'function' && !_isDesktopWidth()) {
+    const sidebar = document.querySelector('.sidebar');
+    if (sidebar) {
+      sidebar.classList.remove('mobile-session-page');
+      sidebar.classList.add('mobile-panel-drawer', 'mobile-open');
+    }
+  }
   // Update nav tabs (rail + mobile sidebar-nav share data-panel)
   document.querySelectorAll('[data-panel]').forEach(t => t.classList.toggle('active', t.dataset.panel === nextPanel));
   // Refresh aria-expanded on the newly-active rail button to mirror sidebar state.
@@ -426,13 +464,6 @@ async function switchPanel(name, opts = {}) {
   if (nextPanel === 'settings') {
     switchSettingsSection(_currentSettingsSection);
     loadSettingsPanel();
-  }
-  if (opts.fromRailClick && typeof _isDesktopWidth === 'function' && !_isDesktopWidth()) {
-    const sidebar = document.querySelector('.sidebar');
-    if (sidebar) {
-      sidebar.classList.remove('mobile-session-page');
-      sidebar.classList.add('mobile-panel-drawer', 'mobile-open');
-    }
   }
   _resyncChatSidebarAfterPanelSwitch();
   if (nextPanel === 'chat' && typeof syncTopbar === 'function') syncTopbar();
@@ -1545,6 +1576,10 @@ function openCronCreate(){
   _cronSkillsCache = null;
   api('/api/skills').then(d=>{_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
   loadCronProfiles().then(()=>_refreshCronProfileSelect('')).catch(()=>{});
+  // Mobile: the cron form lives in the main view, which is covered by the
+  // full-screen sidebar drawer. Close the drawer so the form is visible (mirror
+  // openCronDetail's behaviour); no-op on desktop.
+  _closeMobileSidebarAfterPanelSelection();
 }
 
 function openCronEdit(job){
@@ -3898,12 +3933,8 @@ async function loadKanbanBoards(){
     _kanbanSetSavedBoard('default');
   }
   _kanbanCurrentBoard = (active === 'default') ? null : active;
-  // The switcher is visible whenever ≥1 non-default board exists OR the
-  // current board is non-default. (If you only have 'default', a switcher
-  // adds clutter without value.)
-  const hasMultiple = boards.length > 1 || (active !== 'default');
-  switcher.hidden = !hasMultiple;
-  if (!hasMultiple) return;
+  // Keep the switcher visible because it is also the default-board settings path.
+  switcher.hidden = false;
   // Update the toggle label/icon
   const activeMeta = boards.find(b => b.slug === active) || {slug: active, name: active, icon: '', color: ''};
   const nameEl = document.getElementById('kanbanBoardSwitcherName');
@@ -3947,10 +3978,7 @@ function _renderKanbanBoardMenu(boards, current){
       <span class="kanban-board-switcher-item-count">${esc(String(total))}</span>
     </button>`;
   }).join('');
-  // Actions row — disable rename/archive when the only option is `default`
-  // (the default board's display metadata is editable but the slug isn't,
-  // and `default` cannot be archived).
-  const renameDisabled = current === 'default';
+  // The default board is editable but cannot be archived.
   const archiveDisabled = current === 'default';
   const actions = `
     <div class="kanban-board-switcher-divider" role="separator"></div>
@@ -3958,9 +3986,9 @@ function _renderKanbanBoardMenu(boards, current){
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
       <span>${esc(t('kanban_new_board') || 'New board…')}</span>
     </button>
-    <button type="button" class="kanban-board-switcher-action" onclick="openKanbanRenameBoard()" ${renameDisabled ? 'disabled' : ''} data-i18n="kanban_rename_board">
+    <button type="button" class="kanban-board-switcher-action" onclick="openKanbanRenameBoard()" data-i18n="kanban_rename_board">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
-      <span>${esc(t('kanban_rename_board') || 'Rename current board…')}</span>
+      <span>${esc(t('kanban_rename_board') || 'Board settings…')}</span>
     </button>
     <button type="button" class="kanban-board-switcher-action danger" onclick="archiveKanbanBoard()" ${archiveDisabled ? 'disabled' : ''} data-i18n="kanban_archive_board">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>
@@ -4035,6 +4063,16 @@ async function switchKanbanBoard(slug){
 
 // ── Create / rename / archive board modals ──────────────────────────────────
 
+async function _loadKanbanBoardWorkdirOptions(){
+  await loadWorkspaceList();
+  const list = document.getElementById('kanbanBoardModalWorkdirs');
+  if (!list) return;
+  list.innerHTML = (_workspaceList || []).map(ws => {
+    const path = typeof ws === 'string' ? ws : ws && ws.path;
+    return path ? `<option value="${esc(path)}"></option>` : '';
+  }).join('');
+}
+
 function openKanbanCreateBoard(){
   const modal = document.getElementById('kanbanBoardModal');
   if (!modal) return;
@@ -4048,6 +4086,9 @@ function openKanbanCreateBoard(){
   document.getElementById('kanbanBoardModalDesc').value = '';
   document.getElementById('kanbanBoardModalIcon').value = '';
   document.getElementById('kanbanBoardModalColor').value = '#7aa2ff';
+  document.getElementById('kanbanBoardModalDefaultWorkdir').value = '';
+  document.getElementById('kanbanBoardModalOriginalDefaultWorkdir').value = '';
+  _loadKanbanBoardWorkdirOptions();
   document.getElementById('kanbanBoardModalError').textContent = '';
   modal.hidden = false;
   if (_kanbanBoardModalFocusCleanup) {
@@ -4078,12 +4119,11 @@ function openKanbanRenameBoard(){
   const modal = document.getElementById('kanbanBoardModal');
   if (!modal) return;
   const current = _kanbanCurrentBoard || 'default';
-  if (current === 'default') return;  // default's slug is immutable
   const meta = (_kanbanBoardsList || []).find(b => b.slug === current);
   if (!meta) return;
   document.getElementById('kanbanBoardModalMode').value = 'rename';
   document.getElementById('kanbanBoardModalSlug').value = current;
-  document.getElementById('kanbanBoardModalTitle').textContent = t('kanban_rename_board') || 'Rename board';
+  document.getElementById('kanbanBoardModalTitle').textContent = t('kanban_board_settings') || 'Board settings';
   document.getElementById('kanbanBoardModalName').value = meta.name || '';
   document.getElementById('kanbanBoardModalSlugInput').value = current;
   document.getElementById('kanbanBoardModalSlugInput').disabled = true;  // slug is immutable
@@ -4092,6 +4132,10 @@ function openKanbanRenameBoard(){
   document.getElementById('kanbanBoardModalDesc').value = meta.description || '';
   document.getElementById('kanbanBoardModalIcon').value = meta.icon || '';
   document.getElementById('kanbanBoardModalColor').value = meta.color || '#7aa2ff';
+  const originalDefaultWorkdir = (meta.default_workdir || '').trim();
+  document.getElementById('kanbanBoardModalDefaultWorkdir').value = originalDefaultWorkdir;
+  document.getElementById('kanbanBoardModalOriginalDefaultWorkdir').value = originalDefaultWorkdir;
+  _loadKanbanBoardWorkdirOptions();
   document.getElementById('kanbanBoardModalError').textContent = '';
   modal.hidden = false;
   if (_kanbanBoardModalFocusCleanup) {
@@ -4126,6 +4170,8 @@ async function submitKanbanBoardModal(){
   const description = (document.getElementById('kanbanBoardModalDesc').value || '').trim();
   const icon = (document.getElementById('kanbanBoardModalIcon').value || '').trim();
   const color = (document.getElementById('kanbanBoardModalColor').value || '').trim();
+  const defaultWorkdir = (document.getElementById('kanbanBoardModalDefaultWorkdir').value || '').trim();
+  const originalDefaultWorkdir = (document.getElementById('kanbanBoardModalOriginalDefaultWorkdir').value || '').trim();
   const submitBtn = document.getElementById('kanbanBoardModalSubmit');
   if (!name) {
     errEl.textContent = t('kanban_board_name_required') || 'Name is required';
@@ -4138,9 +4184,11 @@ async function submitKanbanBoardModal(){
     }
     if (submitBtn) submitBtn.disabled = true;
     try {
+      const payload = {slug: slugInput, name, description, icon, color, switch: true};
+      if (defaultWorkdir) payload.default_workdir = defaultWorkdir;
       const res = await api('/api/kanban/boards', {
         method: 'POST',
-        body: JSON.stringify({slug: slugInput, name, description, icon, color, switch: true}),
+        body: JSON.stringify(payload),
       });
       closeKanbanBoardModal();
       // Switch to the new board and reload
@@ -4162,9 +4210,11 @@ async function submitKanbanBoardModal(){
     if (!slug) { errEl.textContent = 'Missing slug'; return; }
     if (submitBtn) submitBtn.disabled = true;
     try {
+      const payload = {name, description, icon, color};
+      if (defaultWorkdir !== originalDefaultWorkdir) payload.default_workdir = defaultWorkdir;
       await api('/api/kanban/boards/' + encodeURIComponent(slug), {
         method: 'PATCH',
-        body: JSON.stringify({name, description, icon, color}),
+        body: JSON.stringify(payload),
       });
       closeKanbanBoardModal();
       await loadKanbanBoards();  // refresh switcher label/icon
@@ -5090,6 +5140,10 @@ function openSkillCreate() {
   _editingSkillName = null;
   _skillMode = 'create';
   _renderSkillForm({ name: '', category: '', content: '', isEdit: false });
+  // Mobile: the new-skill form lives in the main view, which is covered by the
+  // full-screen sidebar drawer. Close the drawer so the form is visible (mirror
+  // openSkillDetail's behaviour); no-op on desktop.
+  _closeMobileSidebarAfterPanelSelection();
 }
 
 function _renderSkillForm({ name, category, content, isEdit }) {
@@ -6138,6 +6192,10 @@ function openWorkspaceCreate(){
   _workspacePreFormDetail = _currentWorkspaceDetail ? { ..._currentWorkspaceDetail } : null;
   _workspaceMode = 'create';
   _renderWorkspaceForm({ name:'', path:'', isEdit:false });
+  // Mobile: the add-space form lives in the main view, which is covered by the
+  // full-screen sidebar drawer. Close the drawer so the form is visible (mirror
+  // openWorkspaceDetail's behaviour); no-op on desktop.
+  _closeMobileSidebarAfterPanelSelection();
 }
 
 function editCurrentWorkspace(){
@@ -7241,6 +7299,10 @@ function openProfileCreate(){
   _profilePreFormDetail = _currentProfileDetail ? { ..._currentProfileDetail } : null;
   _profileMode = 'create';
   _renderProfileForm();
+  // Mobile: the new-profile form lives in the main view, which is covered by the
+  // full-screen sidebar drawer. Close the drawer so the form is visible (mirror
+  // openWorkspaceDetail's behaviour); no-op on desktop.
+  _closeMobileSidebarAfterPanelSelection();
 }
 
 function _renderProfileForm(){
