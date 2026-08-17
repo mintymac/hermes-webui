@@ -204,7 +204,7 @@ def test_list_dir_recovers_missing_implicit_session_workspace(monkeypatch, tmp_p
 
     monkeypatch.setattr(workspace, "_home_path", lambda: tmp_path)
     monkeypatch.setattr(workspace, "load_workspaces", lambda: [])
-    monkeypatch.setattr(routes, "get_session", lambda _sid: session)
+    monkeypatch.setattr(routes, "get_session", lambda _sid, **_kwargs: session)
     monkeypatch.setattr(routes, "get_last_workspace", lambda: str(fallback))
 
     def fake_list_dir(workspace_path, rel_path):
@@ -376,7 +376,7 @@ def test_list_dir_does_not_recover_unpersistable_cli_workspace(
     fallback.mkdir()
     calls = {"fallback": 0, "list_dir": 0}
 
-    monkeypatch.setattr(routes, "get_session", lambda _sid: (_ for _ in ()).throw(KeyError(_sid)))
+    monkeypatch.setattr(routes, "get_session", lambda _sid, **_kwargs: (_ for _ in ()).throw(KeyError(_sid)))
     monkeypatch.setattr(
         routes,
         "get_cli_sessions",
@@ -434,7 +434,7 @@ def test_list_dir_preserves_remote_workspace_rejection(
         lambda: {"terminal": terminal_cfg},
     )
     monkeypatch.setattr(workspace, "_home_path", lambda: tmp_path)
-    monkeypatch.setattr(routes, "get_session", lambda _sid: session)
+    monkeypatch.setattr(routes, "get_session", lambda _sid, **_kwargs: session)
 
     def fallback():
         calls["fallback"] += 1

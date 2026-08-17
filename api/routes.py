@@ -17246,6 +17246,7 @@ def _handle_list_dir(handler, parsed):
         # every directory listing for no benefit.
         s = get_session(sid, metadata_only=True)
         workspace = s.workspace
+        webui_session = s
     except KeyError:
         # Fallback for CLI sessions not loaded in WebUI memory
         try:
