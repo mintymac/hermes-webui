@@ -261,6 +261,54 @@ def test_transient_read_error_without_sidecar_does_not_poison_routing(monkeypatc
     assert store.read_metadata_only(sid)["composer_draft"]["text"] == "ok after recovery"
 
 
+def test_successful_read_after_transient_error_clears_unreadable_mark(monkeypatch):
+    """Greptile P1: a later healthy SQLite read must clear the stale mark.
+
+    A transient error with a sidecar present marks the sid; after recovery
+    the full load comes from SQLite, and drafts must route there too —
+    otherwise save_metadata() keeps writing the sidecar the loads no
+    longer read and the draft goes invisible.
+    """
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", set())
+
+    sid = "sid-recover"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))
+    (d / f"{sid}.json").write_text(
+        json.dumps(_sample_session_dict(sid)), encoding="utf-8"
+    )
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    # Transient failure with a sidecar present: load falls back and marks.
+    assert models.Session.load(sid) is not None
+    assert sid in models._SQLITE_UNREADABLE_SIDS
+
+    # After recovery the load comes from SQLite; the mark must clear so
+    # drafts route back to the store the loads actually read.
+    s = models.Session.load(sid)
+    assert s is not None
+    assert sid not in models._SQLITE_UNREADABLE_SIDS
+
+    s.save_metadata({"composer_draft": {"text": "routed to sqlite", "files": []}})
+    assert store.read_metadata_only(sid)["composer_draft"]["text"] == "routed to sqlite"
+
+
 def test_full_save_heals_corrupt_sqlite_row(monkeypatch):
     """A successful full save() rewrites the row with healthy data and
     clears the unreadable mark, so draft routing returns to SQLite."""

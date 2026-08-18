@@ -1710,6 +1710,11 @@ class Session:
                 data = None
             if data is not None:
                 data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
+                # A successful full read proves the row healthy again (e.g.
+                # after a transient error): clear any stale unreadable mark
+                # so draft routing returns to SQLite — the store this and
+                # every later load will actually read.
+                _SQLITE_UNREADABLE_SIDS.discard(sid)
                 return cls(**data)
             # SQLite is active but this session has not been migrated yet;
             # fall through to the JSON sidecar below.
