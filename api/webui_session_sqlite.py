@@ -430,6 +430,25 @@ class WebUISqliteSessionDB:
             )
         return self._metadata_row(sid)
 
+    def delete_session(self, sid: str) -> bool:
+        """Remove a session and all its rows. Returns True if a row existed.
+
+        Required by /api/session/delete: migrated sessions have no JSON
+        sidecar, so unlinking the sidecar alone leaves the SQLite rows
+        behind — and a full session-index rebuild would then resurrect the
+        deleted session in the sidebar (and keep the transcript on disk).
+        """
+        if not _is_safe_session_id(sid):
+            return False
+        conn = self._conn()
+        with conn:
+            cur = conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+            conn.execute("DELETE FROM tool_calls WHERE session_id = ?", (sid,))
+            conn.execute("DELETE FROM context_messages WHERE session_id = ?", (sid,))
+            conn.execute("DELETE FROM anchor_scenes WHERE session_id = ?", (sid,))
+        return cur.rowcount > 0
+
     def archive(self, sid: str, archived: bool = True) -> dict[str, Any]:
         return self.update_metadata(sid, {"archived": bool(archived)})
 

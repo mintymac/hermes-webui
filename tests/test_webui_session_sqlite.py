@@ -270,6 +270,116 @@ def test_save_refuses_metadata_only_sqlite_session(monkeypatch):
     assert len(reloaded["messages"]) == 2
 
 
+def test_sqlite_store_delete_session_removes_all_rows():
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-del")
+    payload["anchor_activity_scenes"] = {"h1": {"scene": "data"}}
+    store.write_session(payload)
+    assert store.session_exists("sid-del")
+
+    assert store.delete_session("sid-del") is True
+    assert store.session_exists("sid-del") is False
+    assert store.read_session("sid-del") is None
+
+    # No orphan rows left in any child table.
+    conn = _sq.connect(str(d / "sessions.db"))
+    try:
+        for table in ("sessions", "messages", "tool_calls", "context_messages", "anchor_scenes"):
+            col = "scene_hash" if table == "anchor_scenes" else "session_id"
+            (count,) = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE {col} = ?",
+                ("sid-del" if table != "anchor_scenes" else "h1",),
+            ).fetchone()
+            assert count == 0, f"{table} still has rows for sid-del"
+    finally:
+        conn.close()
+
+    # Deleting a missing session is a no-op.
+    assert store.delete_session("sid-del") is False
+
+
+def test_delete_route_removes_sqlite_rows_and_index_does_not_resurrect(monkeypatch):
+    """POST /api/session/delete must remove SQLite-backed sessions too.
+
+    Migrated sessions have no sidecar; previously the route only unlinked
+    the sidecar, leaving the sessions.db row — and a full index rebuild then
+    resurrected the deleted session in the sidebar.
+    """
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-del"))
+
+    import api.routes as routes
+
+    # Keep the CLI state.db out of the test; the WebUI store is under test.
+    monkeypatch.setattr(models, "delete_cli_session", lambda sid: True)
+
+    captured = _drive_delete_post(monkeypatch, {"session_id": "sid-del"})
+    assert captured.get("payload", {}).get("ok") is True
+    assert store.session_exists("sid-del") is False
+
+    # A full index rebuild must not resurrect the deleted session.
+    index_file = d / "_index.json"
+    if index_file.exists():
+        index_file.unlink()
+    models._write_session_index(updates=None, session_dir=d, session_index_file=index_file)
+    entries = json.loads(index_file.read_text())
+    assert all(e.get("session_id") != "sid-del" for e in entries)
+
+
+def test_delete_route_handles_unmigrated_json_session_with_store_active(monkeypatch):
+    """Mixed-store delete: sessions.db exists but the session is JSON-only."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)  # activates sessions.db
+    sidecar = d / "sid-json.json"
+    sidecar.write_text(json.dumps(_sample_session_dict("sid-json")), encoding="utf-8")
+
+    import api.routes as routes
+
+    monkeypatch.setattr(models, "delete_cli_session", lambda sid: True)
+
+    captured = _drive_delete_post(monkeypatch, {"session_id": "sid-json"})
+    assert captured.get("payload", {}).get("ok") is True
+    assert not sidecar.exists()
+    assert store.session_exists("sid-json") is False
+
+
+def _drive_delete_post(monkeypatch, body):
+    """Run POST /api/session/delete through routes.handle_post (CSRF bypassed,
+    JSON responders captured) and return the captured response."""
+    import api.routes as routes
+
+    captured = {}
+    monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
+    monkeypatch.setattr(routes, "read_body", lambda handler: body)
+    monkeypatch.setattr(
+        routes,
+        "bad",
+        lambda handler, msg, status=400, extra_headers=None: captured.update(
+            error=msg, status=status
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda handler, payload, status=200, extra_headers=None, pretty=True: captured.update(
+            payload=payload, status=status
+        )
+        or True,
+    )
+    handler = SimpleNamespace(command="POST", _safe_webui_print=lambda *_a, **_k: None)
+    assert routes.handle_post(handler, SimpleNamespace(path="/api/session/delete")) is True
+    return captured
+
+
 # ── Route-level regressions: POST /api/session/draft through the real
 # routes.handle_post dispatcher, the way the composer's 400ms debounced
 # auto-save actually reaches this code in production. The unit tests above

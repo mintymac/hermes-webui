@@ -15164,6 +15164,18 @@ def handle_post(handler, parsed) -> bool:
                 prune_session_from_index(sid)
             except Exception:
                 logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
+            # Migrated sessions have no JSON sidecar: remove the SQLite rows
+            # too, or the row survives in sessions.db and the next full index
+            # rebuild resurrects the deleted session in the sidebar (with its
+            # transcript still on disk).
+            try:
+                from api.models import _get_sqlite_session_store
+
+                _session_store = _get_sqlite_session_store()
+                if _session_store:
+                    _session_store.delete_session(sid)
+            except Exception:
+                logger.debug("Failed to delete SQLite rows for session %s", sid, exc_info=True)
             try:
                 p.with_suffix('.json.bak').unlink(missing_ok=True)
             except Exception:
@@ -21486,6 +21498,17 @@ def _handle_background(handler, body):
             # next rebuild via _index_entry_exists().
             try:
                 (SESSION_DIR / f"{bg_sid}.json").unlink(missing_ok=True)
+            except Exception:
+                pass
+            # With the SQLite store active the bg session lives in sessions.db
+            # (no sidecar); _index_entry_exists() would keep it indexed
+            # forever, surfacing hidden bg sessions in the sidebar.
+            try:
+                from api.models import _get_sqlite_session_store
+
+                _bg_store = _get_sqlite_session_store()
+                if _bg_store:
+                    _bg_store.delete_session(bg_sid)
             except Exception:
                 pass
         except Exception:
