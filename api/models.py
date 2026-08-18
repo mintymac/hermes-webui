@@ -1676,7 +1676,20 @@ class Session:
         # ── SQLite fast path ─────────────────────────────────────────────
         store = _get_sqlite_session_store()
         if store:
-            data = store.read_session(sid)
+            try:
+                data = store.read_session(sid)
+            except Exception:
+                # A corrupt row (e.g. unreadable message_json) or a DB read
+                # error must not block the JSON sidecar fallback —
+                # load_metadata_only() already degrades the same way, and
+                # propagating here fails session mutation requests for
+                # sessions that still have a valid sidecar.
+                logger.warning(
+                    "SQLite session read failed for %s; falling back to JSON sidecar",
+                    sid,
+                    exc_info=True,
+                )
+                data = None
             if data is not None:
                 data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
                 return cls(**data)

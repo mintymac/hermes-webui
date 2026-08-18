@@ -137,6 +137,44 @@ def test_session_load_falls_back_to_json_when_sqlite_misses_row(monkeypatch):
     assert len(s.messages) == 2
 
 
+def test_session_load_falls_back_to_json_on_sqlite_read_error(monkeypatch):
+    """A corrupt SQLite row must not block the JSON sidecar fallback.
+
+    Greptile P1: read_session() raising (unreadable message_json, DB read
+    error) propagated out of Session.load(), failing mutation requests for
+    sessions whose sidecar is still valid. load_metadata_only() already
+    degrades on store errors; Session.load() now does the same.
+    """
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+
+    sid = "sid-corrupt"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))
+    # Sidecar holds the intact copy (e.g. pre-migration backup).
+    (d / f"{sid}.json").write_text(
+        json.dumps(_sample_session_dict(sid)), encoding="utf-8"
+    )
+
+    # Corrupt the SQLite message payload.
+    conn = _sq.connect(str(d / "sessions.db"))
+    conn.execute(
+        "UPDATE messages SET message_json = 'not-json' WHERE session_id = ?",
+        (sid,),
+    )
+    conn.commit()
+    conn.close()
+
+    s = models.Session.load(sid)
+    assert s is not None
+    assert s.session_id == sid
+    assert len(s.messages) == 2
+
+
 def test_save_metadata_falls_back_to_json_for_unmigrated_session(monkeypatch):
     """sessions.db exists but the session is JSON-only: draft autosave must
     persist to the sidecar, not raise KeyError from a zero-row SQLite UPDATE."""
