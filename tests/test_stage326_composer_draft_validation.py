@@ -81,7 +81,7 @@ def test_draft_validation_appears_before_persist():
     src = Path(__file__).parents[1].joinpath("api", "routes.py").read_text(encoding="utf-8")
     # Anchor on the unique POST-validation comment marker.
     marker_idx = src.find("Stage-326 hardening (per Opus advisor)")
-    persist_idx = src.find("s.composer_draft = next_draft\n                # Draft persistence is not conversation activity")
+    persist_idx = src.find('s.save_metadata({"composer_draft": next_draft})')
     assert marker_idx != -1 and persist_idx != -1, (
         "could not locate validation marker or persist site"
     )
@@ -102,7 +102,7 @@ def test_draft_save_does_not_touch_session_updated_at():
     tests/test_webui_session_sqlite.py route-level tests.)
     """
     src = Path(__file__).parents[1].joinpath("api", "routes.py").read_text(encoding="utf-8")
-    persist_idx = src.find("s.composer_draft = next_draft")
+    persist_idx = src.find("# Draft persistence is not conversation activity")
     assert persist_idx != -1, "could not locate composer draft persist site"
     save_idx = src.find('s.save_metadata({"composer_draft": next_draft})', persist_idx)
     assert save_idx != -1, (

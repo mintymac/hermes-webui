@@ -1453,22 +1453,18 @@ class Session:
             and self.session_id not in _SQLITE_UNREADABLE_SIDS
             and store.session_exists(self.session_id)
         ):
-            # Apply in-memory first so the object stays consistent.
+            # Persist first; apply in-memory only after the write succeeds.
+            # A failed write must leave the cached Session matching what is
+            # actually persisted — otherwise the draft route's unchanged
+            # fast path sees the requested value already in memory and skips
+            # the retry, losing the draft after the next reload.
+            store.update_metadata(self.session_id, fields)
             for k, v in fields.items():
                 setattr(self, k, v)
-            store.update_metadata(self.session_id, fields)
             return
         # JSON fallback: read, update, write back.
         data = json.loads(self.path.read_text(encoding="utf-8"))
         data.update(fields)
-        # Mirror the SQLite branch and keep the in-memory object consistent
-        # with what we just persisted. Without this the JSON path silently
-        # relies on the caller having pre-set every field (the draft route
-        # happens to do so, but save_metadata's contract should be
-        # self-contained so a caller that doesn't pre-set never reads stale
-        # state back).
-        for k, v in fields.items():
-            setattr(self, k, v)
         tmp = self.path.with_suffix(f".tmp.{os.getpid()}.{threading.current_thread().ident}")
         try:
             with open(tmp, "w", encoding="utf-8") as f:
@@ -1482,6 +1478,13 @@ class Session:
             except Exception:
                 pass
             raise
+        # Keep the in-memory object consistent with what was persisted —
+        # but only after the write succeeds. Without this the JSON path
+        # silently relies on the caller having pre-set every field, and a
+        # failed write would leave the cached Session ahead of disk (the
+        # draft route's unchanged fast path would then skip the retry).
+        for k, v in fields.items():
+            setattr(self, k, v)
 
     def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
         if not is_safe_session_id(self.session_id):

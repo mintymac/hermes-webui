@@ -15027,11 +15027,14 @@ def handle_post(handler, parsed) -> bool:
                 unchanged = True
                 saved_draft = current_draft
             else:
-                s.composer_draft = next_draft
                 # Draft persistence is not conversation activity. Touching updated_at
                 # here makes the active-session external-refresh poll force-reload the
                 # current chat every few seconds while the user is typing, and that
                 # delayed reload can restore an older draft over newer local input.
+                # NOTE: no pre-set of s.composer_draft — save_metadata() applies the
+                # in-memory update itself after the write succeeds. Pre-setting here
+                # would leave the cached Session ahead of disk on a failed write,
+                # and the unchanged fast path above would then skip the retry.
                 _draft_mark("before_save")
                 s.save_metadata({"composer_draft": next_draft})
                 _draft_mark("after_save")

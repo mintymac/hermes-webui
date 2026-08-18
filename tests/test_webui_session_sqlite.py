@@ -421,6 +421,118 @@ def test_sqlite_store_delete_session_removes_all_rows():
     assert store.delete_session("sid-del") is False
 
 
+def test_save_metadata_sqlite_write_failure_leaves_in_memory_untouched(monkeypatch):
+    """A failed SQLite metadata write must not poison the cached Session."""
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+
+    sid = "sid-writefail"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    s = models.Session.load(sid)
+    old_draft = dict(getattr(s, "composer_draft", {}) or {})
+
+    def _boom(sid_, fields):
+        raise _sq.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "update_metadata", _boom)
+
+    try:
+        s.save_metadata({"composer_draft": {"text": "lost?", "files": []}})
+    except _sq.OperationalError:
+        pass
+    else:
+        raise AssertionError("write failure must propagate")
+
+    assert (getattr(s, "composer_draft", {}) or {}) == old_draft
+
+
+def test_save_metadata_json_write_failure_leaves_in_memory_untouched(monkeypatch):
+    """A failed sidecar write must not poison the cached Session either."""
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+
+    sid = "sid-jsonfail"
+    sidecar = d / f"{sid}.json"
+    sidecar.write_text(json.dumps(_sample_session_dict(sid)), encoding="utf-8")
+
+    s = models.Session.load(sid)
+    old_draft = dict(getattr(s, "composer_draft", {}) or {})
+
+    monkeypatch.setattr(
+        models,
+        "_safe_replace",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    try:
+        s.save_metadata({"composer_draft": {"text": "lost?", "files": []}})
+    except OSError:
+        pass
+    else:
+        raise AssertionError("write failure must propagate")
+
+    assert (getattr(s, "composer_draft", {}) or {}) == old_draft
+    assert "composer_draft" not in json.loads(sidecar.read_text(encoding="utf-8"))
+
+
+def test_draft_route_retry_after_sqlite_write_failure_persists(monkeypatch):
+    """Greptile P1: a failed write must not poison the draft cache.
+
+    save_metadata() applied the in-memory update before the SQLite write,
+    so a failed write left s.composer_draft ahead of disk; the route's
+    unchanged fast path then skipped the retry and the draft vanished on
+    reload. The route drives POST /api/session/draft through the real
+    dispatcher, fail-once the write, and the identical retry must persist.
+    """
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+
+    sid = "sid-poison"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_update = store.update_metadata
+    calls = {"n": 0}
+
+    def fail_once(sid_, fields):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_update(sid_, fields)
+
+    monkeypatch.setattr(store, "update_metadata", fail_once)
+
+    # First attempt: the write error propagates (production turns it into a 500).
+    try:
+        _drive_draft_post(monkeypatch, {"session_id": sid, "text": "retry me"})
+    except Exception:
+        pass
+    else:
+        raise AssertionError("the failed write must surface")
+
+    # The cached draft must NOT have advanced — the unchanged fast path on
+    # the retry compares against it.
+    s = models.get_session(sid)
+    assert (getattr(s, "composer_draft", {}) or {}).get("text", "") != "retry me"
+
+    # Identical retry: must persist this time (not hit the unchanged path).
+    captured = _drive_draft_post(monkeypatch, {"session_id": sid, "text": "retry me"})
+    assert captured.get("payload", {}).get("ok") is True
+    assert "unchanged" not in captured.get("payload", {})
+    assert store.read_metadata_only(sid)["composer_draft"]["text"] == "retry me"
+
+
 def test_delete_route_removes_sqlite_rows_and_index_does_not_resurrect(monkeypatch):
     """POST /api/session/delete must remove SQLite-backed sessions too.
 
