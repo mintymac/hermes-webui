@@ -239,6 +239,37 @@ def test_update_metadata_advances_updated_at_when_requested():
     assert reloaded["updated_at"] == new_time
 
 
+def test_save_refuses_metadata_only_sqlite_session(monkeypatch):
+    """#1558 P0 guard must also protect the SQLite fast path.
+
+    Session.save() on a session loaded with metadata_only=True would
+    otherwise write messages=[] through write_session(), replacing the
+    message tables and wiping the transcript.
+    """
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-1558"))
+
+    s = models.Session.load_metadata_only("sid-1558")
+    assert s is not None
+    assert getattr(s, "_loaded_metadata_only", False) is True
+
+    try:
+        s.save()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("save() must refuse metadata-only sessions on the SQLite path")
+
+    reloaded = store.read_session("sid-1558")
+    assert reloaded is not None
+    assert len(reloaded["messages"]) == 2
+
+
 # ── Route-level regressions: POST /api/session/draft through the real
 # routes.handle_post dispatcher, the way the composer's 400ms debounced
 # auto-save actually reaches this code in production. The unit tests above

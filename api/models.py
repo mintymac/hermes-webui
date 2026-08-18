@@ -1474,20 +1474,6 @@ class Session:
     def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
         if not is_safe_session_id(self.session_id):
             raise ValueError(f"Unsafe session_id {self.session_id!r}; refusing to write outside session store")
-        # ── SQLite fast path ─────────────────────────────────────────────
-        store = _get_sqlite_session_store()
-        if store:
-            if touch_updated_at:
-                self.updated_at = time.time()
-            payload = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
-            payload.setdefault("messages", [])
-            payload.setdefault("tool_calls", [])
-            payload.setdefault("context_messages", [])
-            payload.setdefault("anchor_activity_scenes", {})
-            store.write_session(payload)
-            if not skip_index:
-                _write_session_index(updates=[self])
-            return
         # ── #1558 P0 guard ──────────────────────────────────────────────
         # Refuse to save a session that was loaded with metadata_only=True.
         # Such sessions have messages=[] (it's the whole point of the partial
@@ -1505,6 +1491,20 @@ class Session:
                 f"Reload with metadata_only=False before mutating state. "
                 f"See #1558."
             )
+        # ── SQLite fast path ─────────────────────────────────────────────
+        store = _get_sqlite_session_store()
+        if store:
+            if touch_updated_at:
+                self.updated_at = time.time()
+            payload = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+            payload.setdefault("messages", [])
+            payload.setdefault("tool_calls", [])
+            payload.setdefault("context_messages", [])
+            payload.setdefault("anchor_activity_scenes", {})
+            store.write_session(payload)
+            if not skip_index:
+                _write_session_index(updates=[self])
+            return
         if touch_updated_at:
             self.updated_at = time.time()
         # Write metadata fields first so load_metadata_only() can read them
