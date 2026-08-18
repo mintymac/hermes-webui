@@ -1237,6 +1237,14 @@ def model_explicit_pick_signature(model, model_provider) -> str:
 # session directory, otherwise the code falls back to JSON sidecars.
 _sqlite_session_store_instance = None
 
+# Sids whose SQLite row failed to read (corrupt payload, DB read error).
+# Session.load() records these when it falls back to the JSON sidecar so
+# save_metadata() does not keep routing draft writes into a row the next
+# load can never read — the autosave would report success while the draft
+# stayed invisible forever. A successful full save() clears the mark: it
+# rewrites the row with healthy data.
+_SQLITE_UNREADABLE_SIDS: set[str] = set()
+
 def _get_sqlite_session_store():
     global _sqlite_session_store_instance
     if _sqlite_session_store_instance is not None:
@@ -1440,7 +1448,11 @@ class Session:
         # such a session's draft autosave to SQLite updates zero rows and the
         # follow-up lookup raises KeyError, losing the draft — so only take
         # the SQLite path when the row is actually there.
-        if store and store.session_exists(self.session_id):
+        if (
+            store
+            and self.session_id not in _SQLITE_UNREADABLE_SIDS
+            and store.session_exists(self.session_id)
+        ):
             # Apply in-memory first so the object stays consistent.
             for k, v in fields.items():
                 setattr(self, k, v)
@@ -1502,6 +1514,7 @@ class Session:
             payload.setdefault("context_messages", [])
             payload.setdefault("anchor_activity_scenes", {})
             store.write_session(payload)
+            _SQLITE_UNREADABLE_SIDS.discard(self.session_id)
             if not skip_index:
                 _write_session_index(updates=[self])
             return
@@ -1689,6 +1702,7 @@ class Session:
                     sid,
                     exc_info=True,
                 )
+                _SQLITE_UNREADABLE_SIDS.add(sid)
                 data = None
             if data is not None:
                 data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))

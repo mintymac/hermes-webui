@@ -175,6 +175,88 @@ def test_session_load_falls_back_to_json_on_sqlite_read_error(monkeypatch):
     assert len(s.messages) == 2
 
 
+def test_save_metadata_routes_to_sidecar_after_sqlite_read_error(monkeypatch):
+    """Greptile P1: an unreadable row must not black-hole draft autosaves.
+
+    Session.load() falls back to the sidecar on a corrupt row; without the
+    unreadable marker, save_metadata() kept routing drafts to SQLite (the
+    row exists) where the next load can never read them — the autosave
+    reported success while the draft stayed invisible.
+    """
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", set())
+
+    sid = "sid-corrupt-draft"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))
+    (d / f"{sid}.json").write_text(
+        json.dumps(_sample_session_dict(sid)), encoding="utf-8"
+    )
+
+    conn = _sq.connect(str(d / "sessions.db"))
+    conn.execute(
+        "UPDATE messages SET message_json = 'not-json' WHERE session_id = ?",
+        (sid,),
+    )
+    conn.commit()
+    conn.close()
+
+    # Load detects the corrupt row and falls back to the sidecar.
+    s = models.Session.load(sid)
+    assert s is not None
+
+    # The draft autosave must go to the sidecar — the store the next load reads.
+    s.save_metadata({"composer_draft": {"text": "draft after corruption", "files": []}})
+
+    reloaded = models.Session.load(sid)
+    assert reloaded is not None
+    assert reloaded.composer_draft["text"] == "draft after corruption"
+
+
+def test_full_save_heals_corrupt_sqlite_row(monkeypatch):
+    """A successful full save() rewrites the row with healthy data and
+    clears the unreadable mark, so draft routing returns to SQLite."""
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", set())
+
+    sid = "sid-heal"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))
+    (d / f"{sid}.json").write_text(
+        json.dumps(_sample_session_dict(sid)), encoding="utf-8"
+    )
+
+    conn = _sq.connect(str(d / "sessions.db"))
+    conn.execute(
+        "UPDATE messages SET message_json = 'not-json' WHERE session_id = ?",
+        (sid,),
+    )
+    conn.commit()
+    conn.close()
+
+    s = models.Session.load(sid)
+    assert sid in models._SQLITE_UNREADABLE_SIDS
+
+    s.save()
+    assert sid not in models._SQLITE_UNREADABLE_SIDS
+
+    # The row is healthy again: loads come from SQLite, drafts route there.
+    (d / f"{sid}.json").unlink()
+    reloaded = models.Session.load(sid)
+    assert reloaded is not None
+    assert len(reloaded.messages) == 2
+
+
 def test_save_metadata_falls_back_to_json_for_unmigrated_session(monkeypatch):
     """sessions.db exists but the session is JSON-only: draft autosave must
     persist to the sidecar, not raise KeyError from a zero-row SQLite UPDATE."""
