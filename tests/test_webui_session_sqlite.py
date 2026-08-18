@@ -351,6 +351,29 @@ def test_delete_route_handles_unmigrated_json_session_with_store_active(monkeypa
     assert store.session_exists("sid-json") is False
 
 
+def test_pre_compression_snapshot_check_reads_sqlite_store(monkeypatch):
+    """_is_pre_compression_snapshot_id must work for migrated sessions.
+
+    The sidebar lineage grouping reads the sidecar directly; a migrated
+    (SQLite-only) snapshot parent would look like a non-snapshot and its
+    continuation rows would lose their grouping.
+    """
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    snap = _sample_session_dict("snap_parent")
+    snap["pre_compression_snapshot"] = True
+    store.write_session(snap)
+    store.write_session(_sample_session_dict("plain_parent"))
+
+    import api.routes as routes
+
+    assert routes._is_pre_compression_snapshot_id("snap_parent") is True
+    assert routes._is_pre_compression_snapshot_id("plain_parent") is False
+    assert routes._is_pre_compression_snapshot_id("missing_parent") is False
+
+
 def _drive_delete_post(monkeypatch, body):
     """Run POST /api/session/delete through routes.handle_post (CSRF bypassed,
     JSON responders captured) and return the captured response."""
