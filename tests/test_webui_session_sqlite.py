@@ -218,6 +218,49 @@ def test_save_metadata_routes_to_sidecar_after_sqlite_read_error(monkeypatch):
     assert reloaded.composer_draft["text"] == "draft after corruption"
 
 
+def test_transient_read_error_without_sidecar_does_not_poison_routing(monkeypatch):
+    """Greptile P1: a transient read error must not stick a migrated
+    (sidecar-less) session to the JSON write path.
+
+    The unreadable mark means "the sidecar just saved us" — with no sidecar
+    there is nothing to route to, and a stuck mark would make save_metadata()
+    read a missing sidecar and 500 every autosave after the DB recovers.
+    """
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", set())
+
+    sid = "sid-transient"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    # Transient failure, no sidecar: the session is unavailable this request,
+    # but must NOT be marked unreadable.
+    assert models.Session.load(sid) is None
+    assert sid not in models._SQLITE_UNREADABLE_SIDS
+
+    # DB recovered: loads and draft autosaves use SQLite normally.
+    s = models.Session.load(sid)
+    assert s is not None
+    s.save_metadata({"composer_draft": {"text": "ok after recovery", "files": []}})
+    assert store.read_metadata_only(sid)["composer_draft"]["text"] == "ok after recovery"
+
+
 def test_full_save_heals_corrupt_sqlite_row(monkeypatch):
     """A successful full save() rewrites the row with healthy data and
     clears the unreadable mark, so draft routing returns to SQLite."""

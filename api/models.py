@@ -1691,6 +1691,7 @@ class Session:
             return None
         # ── SQLite fast path ─────────────────────────────────────────────
         store = _get_sqlite_session_store()
+        sqlite_read_failed = False
         if store:
             try:
                 data = store.read_session(sid)
@@ -1705,7 +1706,7 @@ class Session:
                     sid,
                     exc_info=True,
                 )
-                _SQLITE_UNREADABLE_SIDS.add(sid)
+                sqlite_read_failed = True
                 data = None
             if data is not None:
                 data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
@@ -1715,6 +1716,10 @@ class Session:
         # ── JSON sidecar fallback ────────────────────────────────────────
         p = SESSION_DIR / f'{sid}.json'
         if not p.exists():
+            # A migrated (sidecar-less) session whose row hit a *transient*
+            # read error is simply unavailable this request — do NOT mark it
+            # unreadable, or save_metadata() would keep routing drafts to a
+            # sidecar that does not exist after the database recovers.
             return None
         # #5854: snapshot the stat signature BEFORE reading so a legacy-facts
         # cache write is only committed if the file didn't change under us
@@ -1752,6 +1757,12 @@ class Session:
                     )
                 except Exception:
                     logger.debug("legacy sidecar facts cache populate failed for %s", sid, exc_info=True)
+        if sqlite_read_failed:
+            # The SQLite row exists but is unreadable and the sidecar just
+            # proved itself the authoritative copy: route future metadata
+            # writes to the sidecar too, or drafts written to SQLite would
+            # never be read back. A successful full save() clears the mark.
+            _SQLITE_UNREADABLE_SIDS.add(sid)
         return session
 
     @classmethod
