@@ -1237,13 +1237,16 @@ def model_explicit_pick_signature(model, model_provider) -> str:
 # session directory, otherwise the code falls back to JSON sidecars.
 _sqlite_session_store_instance = None
 
-# Sids whose SQLite row failed to read (corrupt payload, DB read error).
-# Session.load() records these when it falls back to the JSON sidecar so
-# save_metadata() does not keep routing draft writes into a row the next
-# load can never read — the autosave would report success while the draft
-# stayed invisible forever. A successful full save() clears the mark: it
-# rewrites the row with healthy data.
-_SQLITE_UNREADABLE_SIDS: set[str] = set()
+# Sids whose SQLite row failed to read (corrupt payload, DB read error),
+# mapped to the sidecar's composer_draft at the moment the fallback load
+# succeeded. Session.load() records these so save_metadata() does not keep
+# routing draft writes into a row the next load can never read — the
+# autosave would report success while the draft stayed invisible forever.
+# A successful full save() clears the mark (it rewrites the row with
+# healthy data, including the in-memory draft); a successful full read
+# clears it too, first carrying the sidecar draft back into SQLite if it
+# moved while the sid was marked.
+_SQLITE_UNREADABLE_SIDS: dict[str, object] = {}
 
 def _get_sqlite_session_store():
     global _sqlite_session_store_instance
@@ -1517,7 +1520,7 @@ class Session:
             payload.setdefault("context_messages", [])
             payload.setdefault("anchor_activity_scenes", {})
             store.write_session(payload)
-            _SQLITE_UNREADABLE_SIDS.discard(self.session_id)
+            _SQLITE_UNREADABLE_SIDS.pop(self.session_id, None)
             if not skip_index:
                 _write_session_index(updates=[self])
             return
@@ -1711,10 +1714,26 @@ class Session:
             if data is not None:
                 data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
                 # A successful full read proves the row healthy again (e.g.
-                # after a transient error): clear any stale unreadable mark
-                # so draft routing returns to SQLite — the store this and
-                # every later load will actually read.
-                _SQLITE_UNREADABLE_SIDS.discard(sid)
+                # after a transient error): clear the unreadable mark so
+                # draft routing returns to SQLite — the store this and every
+                # later load will actually read. But reconcile first: drafts
+                # saved while the sid was marked went to the sidecar, and
+                # clearing the mark without carrying them over would make
+                # those successfully-saved drafts disappear on this load.
+                # Only a draft that MOVED since the mark is carried back —
+                # an unchanged sidecar holds no marked-window writes, and
+                # clobbering the row with it could regress a newer draft.
+                if sid in _SQLITE_UNREADABLE_SIDS:
+                    at_mark = _SQLITE_UNREADABLE_SIDS.pop(sid)
+                    try:
+                        sidecar = SESSION_DIR / f'{sid}.json'
+                        if sidecar.exists():
+                            live = json.loads(sidecar.read_text(encoding='utf-8')).get('composer_draft')
+                            if live != at_mark:
+                                store.update_metadata(sid, {"composer_draft": live})
+                                data['composer_draft'] = live
+                    except Exception:
+                        logger.debug("Failed to reconcile fallback draft for %s", sid, exc_info=True)
                 return cls(**data)
             # SQLite is active but this session has not been migrated yet;
             # fall through to the JSON sidecar below.
@@ -1766,8 +1785,11 @@ class Session:
             # The SQLite row exists but is unreadable and the sidecar just
             # proved itself the authoritative copy: route future metadata
             # writes to the sidecar too, or drafts written to SQLite would
-            # never be read back. A successful full save() clears the mark.
-            _SQLITE_UNREADABLE_SIDS.add(sid)
+            # never be read back. Snapshot the sidecar draft so a later
+            # recovery can tell marked-window draft writes apart from a
+            # sidecar that simply predates the row. A successful full
+            # save() or read clears the mark.
+            _SQLITE_UNREADABLE_SIDS[sid] = data.get("composer_draft")
         return session
 
     @classmethod

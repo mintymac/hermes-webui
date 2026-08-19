@@ -189,7 +189,7 @@ def test_save_metadata_routes_to_sidecar_after_sqlite_read_error(monkeypatch):
     monkeypatch.setattr(models, "SESSION_DIR", d)
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
     monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
-    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", set())
+    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", {})
 
     sid = "sid-corrupt-draft"
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
@@ -231,7 +231,7 @@ def test_transient_read_error_without_sidecar_does_not_poison_routing(monkeypatc
     d = _tmp_session_dir()
     monkeypatch.setattr(models, "SESSION_DIR", d)
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
-    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", set())
+    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", {})
 
     sid = "sid-transient"
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
@@ -274,7 +274,7 @@ def test_successful_read_after_transient_error_clears_unreadable_mark(monkeypatc
     d = _tmp_session_dir()
     monkeypatch.setattr(models, "SESSION_DIR", d)
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
-    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", set())
+    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", {})
 
     sid = "sid-recover"
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
@@ -309,6 +309,102 @@ def test_successful_read_after_transient_error_clears_unreadable_mark(monkeypatc
     assert store.read_metadata_only(sid)["composer_draft"]["text"] == "routed to sqlite"
 
 
+def test_recovery_carries_draft_written_while_marked(monkeypatch):
+    """Greptile P1: drafts saved to the sidecar while marked must survive
+    the routing flip back to SQLite.
+
+    Transient read error with a sidecar present marks the sid and routes
+    drafts to the sidecar; on recovery the next full load reads the SQLite
+    row, and without reconciliation the sidecar draft would be stranded.
+    """
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", {})
+
+    sid = "sid-flip"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))
+    (d / f"{sid}.json").write_text(
+        json.dumps(_sample_session_dict(sid)), encoding="utf-8"
+    )
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    # Transient failure with a sidecar: fallback load succeeds, sid marked.
+    s = models.Session.load(sid)
+    assert s is not None
+    assert sid in models._SQLITE_UNREADABLE_SIDS
+
+    # While marked, the draft autosave routes to the sidecar.
+    s.save_metadata({"composer_draft": {"text": "typed during outage", "files": []}})
+    assert json.loads((d / f"{sid}.json").read_text(encoding="utf-8"))[
+        "composer_draft"
+    ]["text"] == "typed during outage"
+
+    # Recovery: the next full load reads the SQLite row — and must carry
+    # the sidecar-saved draft into it instead of letting it disappear.
+    s2 = models.Session.load(sid)
+    assert s2 is not None
+    assert sid not in models._SQLITE_UNREADABLE_SIDS
+    assert s2.composer_draft["text"] == "typed during outage"
+    assert store.read_metadata_only(sid)["composer_draft"]["text"] == "typed during outage"
+
+
+def test_recovery_does_not_clobber_newer_sqlite_draft(monkeypatch):
+    """A sidecar whose draft did not move while marked must not regress a
+    newer draft already in the SQLite row."""
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", {})
+
+    sid = "sid-noclobber"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))
+    store.update_metadata(sid, {"composer_draft": {"text": "newer in sqlite", "files": []}})
+    sidecar_payload = _sample_session_dict(sid)
+    sidecar_payload["composer_draft"] = {"text": "older in sidecar", "files": []}
+    (d / f"{sid}.json").write_text(json.dumps(sidecar_payload), encoding="utf-8")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    # Fallback load marks the sid with the sidecar's (older) draft; no
+    # draft writes happen while marked.
+    assert models.Session.load(sid) is not None
+    assert sid in models._SQLITE_UNREADABLE_SIDS
+
+    # Recovery clears the mark and must NOT copy the older sidecar draft
+    # over the newer SQLite one.
+    assert models.Session.load(sid) is not None
+    assert sid not in models._SQLITE_UNREADABLE_SIDS
+    assert store.read_metadata_only(sid)["composer_draft"]["text"] == "newer in sqlite"
+
+
 def test_full_save_heals_corrupt_sqlite_row(monkeypatch):
     """A successful full save() rewrites the row with healthy data and
     clears the unreadable mark, so draft routing returns to SQLite."""
@@ -318,7 +414,7 @@ def test_full_save_heals_corrupt_sqlite_row(monkeypatch):
     monkeypatch.setattr(models, "SESSION_DIR", d)
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
     monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
-    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", set())
+    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", {})
 
     sid = "sid-heal"
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
