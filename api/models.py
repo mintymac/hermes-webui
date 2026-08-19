@@ -1239,13 +1239,13 @@ _sqlite_session_store_instance = None
 
 # Sids whose SQLite row failed to read (corrupt payload, DB read error),
 # mapped to the sidecar's composer_draft at the moment the fallback load
-# succeeded. Session.load() records these so save_metadata() does not keep
-# routing draft writes into a row the next load can never read — the
-# autosave would report success while the draft stayed invisible forever.
-# A successful full save() clears the mark (it rewrites the row with
-# healthy data, including the in-memory draft); a successful full read
-# clears it too, first carrying the sidecar draft back into SQLite if it
-# moved while the sid was marked.
+# succeeded. While a sid is marked, its JSON sidecar is authoritative for
+# BOTH reads (Session.load / load_metadata_only) and metadata writes
+# (save_metadata) — keeping one store on both sides is what prevents
+# drafts saved during the outage from disappearing behind a flip back to
+# SQLite. The mark clears when a full save() heals the row with the
+# (sidecar-loaded) in-memory state, or when the sidecar disappears and
+# the row reads healthy again.
 _SQLITE_UNREADABLE_SIDS: dict[str, object] = {}
 
 def _get_sqlite_session_store():
@@ -1695,7 +1695,15 @@ class Session:
         # ── SQLite fast path ─────────────────────────────────────────────
         store = _get_sqlite_session_store()
         sqlite_read_failed = False
-        if store:
+        if store and sid in _SQLITE_UNREADABLE_SIDS:
+            # While marked, the sidecar is authoritative for reads AND
+            # writes: save_metadata() routes drafts there, so loads must
+            # read it too, or drafts saved during the outage would be
+            # invisible here. The mark clears when a full save() heals the
+            # row with the (sidecar-loaded) in-memory state, or below when
+            # the sidecar itself is gone and the row reads healthy again.
+            pass
+        elif store:
             try:
                 data = store.read_session(sid)
             except Exception:
@@ -1713,37 +1721,28 @@ class Session:
                 data = None
             if data is not None:
                 data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
-                # A successful full read proves the row healthy again (e.g.
-                # after a transient error): clear the unreadable mark so
-                # draft routing returns to SQLite — the store this and every
-                # later load will actually read. But reconcile first: drafts
-                # saved while the sid was marked went to the sidecar, and
-                # clearing the mark without carrying them over would make
-                # those successfully-saved drafts disappear on this load.
-                # Only a draft that MOVED since the mark is carried back —
-                # an unchanged sidecar holds no marked-window writes, and
-                # clobbering the row with it could regress a newer draft.
-                if sid in _SQLITE_UNREADABLE_SIDS:
-                    at_mark = _SQLITE_UNREADABLE_SIDS.pop(sid)
-                    try:
-                        sidecar = SESSION_DIR / f'{sid}.json'
-                        if sidecar.exists():
-                            live = json.loads(sidecar.read_text(encoding='utf-8')).get('composer_draft')
-                            if live != at_mark:
-                                store.update_metadata(sid, {"composer_draft": live})
-                                data['composer_draft'] = live
-                    except Exception:
-                        logger.debug("Failed to reconcile fallback draft for %s", sid, exc_info=True)
                 return cls(**data)
             # SQLite is active but this session has not been migrated yet;
             # fall through to the JSON sidecar below.
         # ── JSON sidecar fallback ────────────────────────────────────────
         p = SESSION_DIR / f'{sid}.json'
         if not p.exists():
+            if store and sid in _SQLITE_UNREADABLE_SIDS:
+                # Sidecar vanished while marked; if the row reads healthy
+                # again there is nothing left to protect — drop the mark
+                # and use the row.
+                _SQLITE_UNREADABLE_SIDS.pop(sid, None)
+                try:
+                    data = store.read_session(sid)
+                except Exception:
+                    data = None
+                if data is not None:
+                    data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
+                    return cls(**data)
             # A migrated (sidecar-less) session whose row hit a *transient*
-            # read error is simply unavailable this request — do NOT mark it
-            # unreadable, or save_metadata() would keep routing drafts to a
-            # sidecar that does not exist after the database recovers.
+            # read error is simply unavailable this request — it was never
+            # marked, so save_metadata() will not route drafts to a
+            # nonexistent sidecar after the database recovers.
             return None
         # #5854: snapshot the stat signature BEFORE reading so a legacy-facts
         # cache write is only committed if the file didn't change under us
@@ -1806,9 +1805,10 @@ class Session:
         if not is_safe_session_id(sid):
             return None
         # SQLite fast path: metadata lives in the sessions table.
+        # Marked sids read the sidecar instead (see _SQLITE_UNREADABLE_SIDS).
         try:
             store = _get_sqlite_session_store()
-            if store:
+            if store and sid not in _SQLITE_UNREADABLE_SIDS:
                 data = store.read_metadata_only(sid)
                 if data is not None:
                     data['messages'] = []

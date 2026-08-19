@@ -261,13 +261,14 @@ def test_transient_read_error_without_sidecar_does_not_poison_routing(monkeypatc
     assert store.read_metadata_only(sid)["composer_draft"]["text"] == "ok after recovery"
 
 
-def test_successful_read_after_transient_error_clears_unreadable_mark(monkeypatch):
-    """Greptile P1: a later healthy SQLite read must clear the stale mark.
+def test_marked_sid_reads_and_writes_sidecar_until_save_heals(monkeypatch):
+    """While marked, the sidecar is authoritative for reads AND writes.
 
-    A transient error with a sidecar present marks the sid; after recovery
-    the full load comes from SQLite, and drafts must route there too —
-    otherwise save_metadata() keeps writing the sidecar the loads no
-    longer read and the draft goes invisible.
+    After SQLite recovers, loads keep reading the sidecar (the store the
+    marked-window drafts went to) until a full save() heals the row with
+    the sidecar-loaded state; only then does routing return to SQLite.
+    Clearing the mark on a bare read would flip loads back to the row and
+    strand the sidecar-saved drafts (Greptile P1).
     """
     import sqlite3 as _sq
 
@@ -295,77 +296,35 @@ def test_successful_read_after_transient_error_clears_unreadable_mark(monkeypatc
 
     monkeypatch.setattr(store, "read_session", fail_once)
 
-    # Transient failure with a sidecar present: load falls back and marks.
+    # Transient failure with a sidecar: fallback load succeeds, sid marked.
     assert models.Session.load(sid) is not None
     assert sid in models._SQLITE_UNREADABLE_SIDS
 
-    # After recovery the load comes from SQLite; the mark must clear so
-    # drafts route back to the store the loads actually read.
-    s = models.Session.load(sid)
-    assert s is not None
-    assert sid not in models._SQLITE_UNREADABLE_SIDS
-
-    s.save_metadata({"composer_draft": {"text": "routed to sqlite", "files": []}})
-    assert store.read_metadata_only(sid)["composer_draft"]["text"] == "routed to sqlite"
-
-
-def test_recovery_carries_draft_written_while_marked(monkeypatch):
-    """Greptile P1: drafts saved to the sidecar while marked must survive
-    the routing flip back to SQLite.
-
-    Transient read error with a sidecar present marks the sid and routes
-    drafts to the sidecar; on recovery the next full load reads the SQLite
-    row, and without reconciliation the sidecar draft would be stranded.
-    """
-    import sqlite3 as _sq
-
-    d = _tmp_session_dir()
-    monkeypatch.setattr(models, "SESSION_DIR", d)
-    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
-    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", {})
-
-    sid = "sid-flip"
-    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
-    store.write_session(_sample_session_dict(sid))
-    (d / f"{sid}.json").write_text(
-        json.dumps(_sample_session_dict(sid)), encoding="utf-8"
-    )
-    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
-
-    real_read = store.read_session
-    calls = {"n": 0}
-
-    def fail_once(sid_):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise _sq.OperationalError("database is locked")
-        return real_read(sid_)
-
-    monkeypatch.setattr(store, "read_session", fail_once)
-
-    # Transient failure with a sidecar: fallback load succeeds, sid marked.
+    # DB recovered, but while marked the sidecar stays authoritative:
+    # drafts route to it and loads read from it.
     s = models.Session.load(sid)
     assert s is not None
     assert sid in models._SQLITE_UNREADABLE_SIDS
-
-    # While marked, the draft autosave routes to the sidecar.
-    s.save_metadata({"composer_draft": {"text": "typed during outage", "files": []}})
+    s.save_metadata({"composer_draft": {"text": "sidecar draft", "files": []}})
     assert json.loads((d / f"{sid}.json").read_text(encoding="utf-8"))[
         "composer_draft"
-    ]["text"] == "typed during outage"
+    ]["text"] == "sidecar draft"
+    assert models.Session.load(sid).composer_draft["text"] == "sidecar draft"
 
-    # Recovery: the next full load reads the SQLite row — and must carry
-    # the sidecar-saved draft into it instead of letting it disappear.
-    s2 = models.Session.load(sid)
-    assert s2 is not None
+    # A full save() heals the row with the sidecar-loaded state and clears
+    # the mark; routing returns to SQLite with the draft intact.
+    s.save()
     assert sid not in models._SQLITE_UNREADABLE_SIDS
-    assert s2.composer_draft["text"] == "typed during outage"
-    assert store.read_metadata_only(sid)["composer_draft"]["text"] == "typed during outage"
+    assert store.read_metadata_only(sid)["composer_draft"]["text"] == "sidecar draft"
+    (d / f"{sid}.json").unlink()
+    reloaded = models.Session.load(sid)
+    assert reloaded is not None
+    assert reloaded.composer_draft["text"] == "sidecar draft"
 
 
-def test_recovery_does_not_clobber_newer_sqlite_draft(monkeypatch):
-    """A sidecar whose draft did not move while marked must not regress a
-    newer draft already in the SQLite row."""
+def test_marked_sid_does_not_touch_sqlite_row_until_save(monkeypatch):
+    """While marked, no reconcile write may touch the row — so a stale
+    sidecar can never clobber a newer SQLite draft automatically."""
     import sqlite3 as _sq
 
     d = _tmp_session_dir()
@@ -393,16 +352,52 @@ def test_recovery_does_not_clobber_newer_sqlite_draft(monkeypatch):
 
     monkeypatch.setattr(store, "read_session", fail_once)
 
-    # Fallback load marks the sid with the sidecar's (older) draft; no
-    # draft writes happen while marked.
     assert models.Session.load(sid) is not None
     assert sid in models._SQLITE_UNREADABLE_SIDS
 
-    # Recovery clears the mark and must NOT copy the older sidecar draft
-    # over the newer SQLite one.
+    # DB recovered; while marked, loads keep reading the sidecar and the
+    # row keeps its newer draft — nothing is reconciled or clobbered.
     assert models.Session.load(sid) is not None
-    assert sid not in models._SQLITE_UNREADABLE_SIDS
+    assert sid in models._SQLITE_UNREADABLE_SIDS
     assert store.read_metadata_only(sid)["composer_draft"]["text"] == "newer in sqlite"
+
+
+def test_marked_sid_without_sidecar_falls_back_to_healthy_row(monkeypatch):
+    """If the sidecar disappears while marked and the row reads healthy,
+    the mark clears — there is nothing left to protect."""
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", {})
+
+    sid = "sid-gone-sidecar"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))
+    (d / f"{sid}.json").write_text(
+        json.dumps(_sample_session_dict(sid)), encoding="utf-8"
+    )
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    assert models.Session.load(sid) is not None
+    assert sid in models._SQLITE_UNREADABLE_SIDS
+
+    (d / f"{sid}.json").unlink()
+    s = models.Session.load(sid)
+    assert s is not None
+    assert sid not in models._SQLITE_UNREADABLE_SIDS
 
 
 def test_full_save_heals_corrupt_sqlite_row(monkeypatch):
