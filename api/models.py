@@ -1602,10 +1602,32 @@ class Session:
             # force only for a deliberate heal of a row marked unreadable.
             # expected_generation carries the CAS lineage the object was
             # loaded with; the store compares-and-bumps atomically.
+            _heal = self.session_id in _SQLITE_UNREADABLE_SIDS
+            if _heal:
+                # The row's header may still be readable even when the
+                # transcript is not. If no draft was written while marked
+                # (the in-memory draft still equals the mark-time sidecar
+                # value), the row's draft is the newer truth — carry it
+                # through the heal instead of regressing it with the stale
+                # sidecar draft the object was loaded with.
+                _at_mark = _SQLITE_UNREADABLE_SIDS.get(self.session_id)
+                try:
+                    _row_meta = store.read_metadata_only(self.session_id)
+                except Exception:
+                    _row_meta = None
+                if _row_meta is not None:
+                    _row_draft = _row_meta.get("composer_draft")
+                    if (
+                        _row_draft is not None
+                        and getattr(self, "composer_draft", None) == _at_mark
+                        and _row_draft != _at_mark
+                    ):
+                        self.composer_draft = _row_draft
+                        payload["composer_draft"] = _row_draft
             _write_result = store.write_session(
                 payload,
                 expected_generation=getattr(self, "_persisted_generation", None),
-                force=self.session_id in _SQLITE_UNREADABLE_SIDS,
+                force=_heal,
             )
             _SQLITE_UNREADABLE_SIDS.pop(self.session_id, None)
             if isinstance(_write_result, dict) and _write_result.get("generation") is not None:
@@ -1825,15 +1847,18 @@ class Session:
             if store.backend != "json" and sid in _SQLITE_UNREADABLE_SIDS:
                 # Sidecar vanished while marked; if the row reads healthy
                 # again there is nothing left to protect — drop the mark
-                # and use the row.
-                _SQLITE_UNREADABLE_SIDS.pop(sid, None)
+                # and use the row. If the row is STILL unreadable, keep the
+                # mark: popping it would flip draft routing to the row while
+                # every load keeps failing, stranding autosaves.
                 try:
                     data = store.read_session(sid)
                 except Exception:
                     data = None
                 if data is not None:
+                    _SQLITE_UNREADABLE_SIDS.pop(sid, None)
                     data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
                     return cls(**data)
+                return None
             # A migrated (sidecar-less) session whose row hit a *transient*
             # read error is simply unavailable this request — it was never
             # marked, so save_metadata() will not route drafts to a
