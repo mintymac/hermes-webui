@@ -21,6 +21,7 @@ import copy
 import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -265,7 +266,14 @@ CREATE INDEX IF NOT EXISTS idx_context_messages_session ON context_messages(sess
 """
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
+
+_META_SQL = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
 
 # Columns added in schema v2 (name -> ALTER TABLE DDL). CREATE TABLE carries
 # them for fresh databases; these run for pre-v2 databases.
@@ -327,6 +335,16 @@ class WebUISqliteSessionDB:
         for col, ddl in _SESSIONS_V2_COLUMNS.items():
             if col not in existing:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {ddl}")
+        conn.executescript(_META_SQL)
+        # Durable cutover marker. Fresh app-created databases seed 'app';
+        # a db with rows but no meta predates markers ('legacy'); the
+        # migration script overwrites with 'migration' + migration_complete.
+        if conn.execute("SELECT 1 FROM meta WHERE key = 'created_by'").fetchone() is None:
+            has_rows = conn.execute("SELECT 1 FROM sessions LIMIT 1").fetchone() is not None
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('created_by', ?)",
+                ("legacy" if has_rows else "app",),
+            )
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
 
@@ -335,6 +353,56 @@ class WebUISqliteSessionDB:
         if conn is not None:
             conn.close()
             self._local.conn = None
+
+    def _bump_revision(self, conn: sqlite3.Connection) -> None:
+        """Advance the store revision. Must run inside a write transaction so
+        the counter moves atomically with the change it describes."""
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('revision', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
+        )
+
+    def get_revision(self) -> int:
+        """Monotonic change counter for cache invalidation. A read error
+        returns a never-repeating value so caches fail open rather than stale."""
+        try:
+            row = self._conn().execute(
+                "SELECT value FROM meta WHERE key = 'revision'"
+            ).fetchone()
+            return int(row["value"]) if row is not None else 0
+        except Exception:
+            return int(time.time_ns())
+
+    def is_active(self) -> bool:
+        """Durable cutover check: a database the migration script started but
+        never completed must not take authority. App-created and legacy
+        (pre-marker) databases are always active."""
+        try:
+            rows = self._conn().execute("SELECT key, value FROM meta").fetchall()
+            meta = {row["key"]: row["value"] for row in rows}
+        except Exception:
+            return True  # pre-meta databases were app-created
+        if meta.get("created_by") == "migration" and meta.get("migration_complete") != "1":
+            return False
+        return True
+
+    def set_meta(self, key: str, value: str) -> None:
+        conn = self._conn()
+        with conn:
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
+    def get_meta(self, key: str) -> str | None:
+        try:
+            row = self._conn().execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+            return row["value"] if row is not None else None
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Read paths
@@ -410,7 +478,7 @@ class WebUISqliteSessionDB:
     # Write paths
     # ------------------------------------------------------------------
 
-    def write_session(self, session: dict[str, Any]) -> dict[str, Any]:
+    def write_session(self, session: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
         if not isinstance(session, dict):
             raise TypeError("session must be a dict")
         sid = session.get("session_id")
@@ -429,7 +497,8 @@ class WebUISqliteSessionDB:
 
         conn = self._conn()
         with conn:
-            self._write_session_row(conn, sid, payload)
+            self._bump_revision(conn)
+            self._write_session_row(conn, sid, payload, force=force)
             self._write_messages(conn, sid, messages)
             self._write_tool_calls(conn, sid, tool_calls)
             self._write_context_messages(conn, sid, context_messages)
@@ -445,6 +514,7 @@ class WebUISqliteSessionDB:
 
         conn = self._conn()
         with conn:
+            self._bump_revision(conn)
             set_parts: list[str] = []
             values: list[Any] = []
             extras: dict[str, Any] = {}
@@ -499,6 +569,7 @@ class WebUISqliteSessionDB:
             return False
         conn = self._conn()
         with conn:
+            self._bump_revision(conn)
             cur = conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
             conn.execute("DELETE FROM tool_calls WHERE session_id = ?", (sid,))
@@ -513,7 +584,7 @@ class WebUISqliteSessionDB:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _write_session_row(self, conn: sqlite3.Connection, sid: str, payload: dict[str, Any]) -> None:
+    def _write_session_row(self, conn: sqlite3.Connection, sid: str, payload: dict[str, Any], *, force: bool = False) -> None:
         cols = ["session_id"]
         vals: list[Any] = [sid]
         for field in _SESSION_SCALAR_FIELDS:
@@ -549,12 +620,27 @@ class WebUISqliteSessionDB:
         vals.append(_json_dump(extra) if extra else None)
 
         placeholders = ", ".join("?" for _ in cols)
-        conn.execute(
+        # Stale-writer fence: a full write may only replace a row whose
+        # persisted updated_at is not newer. A stale recovered sidecar (or
+        # any regressive writer) is refused loudly instead of silently
+        # rolling the session back. force=True is reserved for deliberate
+        # heals (e.g. rewriting a row marked unreadable from its sidecar).
+        guard = (
+            ""
+            if force
+            else " WHERE COALESCE(excluded.updated_at, -1) >= COALESCE(sessions.updated_at, -1)"
+        )
+        cur = conn.execute(
             f"INSERT INTO sessions ({', '.join(cols)}) VALUES ({placeholders}) "
             "ON CONFLICT(session_id) DO UPDATE SET "
-            + ", ".join(f"{c}=excluded.{c}" for c in cols),
+            + ", ".join(f"{c}=excluded.{c}" for c in cols)
+            + guard,
             vals,
         )
+        if cur.rowcount == 0:
+            raise StaleSessionWriteError(
+                f"Refusing to overwrite newer persisted session {sid!r} with older state"
+            )
 
     def _write_messages(self, conn: sqlite3.Connection, sid: str, messages: list[Any]) -> None:
         conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
@@ -637,6 +723,10 @@ class WebUISqliteSessionDB:
         if scenes_json is not None:
             session["anchor_activity_scenes"] = json.loads(scenes_json)
         return session
+
+
+class StaleSessionWriteError(RuntimeError):
+    """A full-session write tried to overwrite a newer persisted generation."""
 
 
 def _is_safe_session_id(sid: Any) -> bool:

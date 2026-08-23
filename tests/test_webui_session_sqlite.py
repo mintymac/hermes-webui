@@ -153,7 +153,7 @@ def test_schema_v2_migration_adds_columns_to_legacy_db():
     conn = _sq.connect(str(db_path))
     (version,) = conn.execute("PRAGMA user_version").fetchone()
     conn.close()
-    assert version == 2
+    assert version == sqlite_db._SCHEMA_VERSION
 
 
 def test_session_load_uses_sqlite_when_db_exists(monkeypatch):
@@ -176,7 +176,7 @@ def test_persisted_session_ids_includes_sqlite(monkeypatch):
     d = _tmp_session_dir()
     monkeypatch.setattr(models, "SESSION_DIR", d)
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
-    monkeypatch.setattr(models, "_PERSISTED_SESSION_IDS_CACHE", (None, None, frozenset()))
+    monkeypatch.setattr(models, "_PERSISTED_SESSION_IDS_CACHE", (None, None, None, frozenset()))
     monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
 
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
@@ -184,6 +184,136 @@ def test_persisted_session_ids_includes_sqlite(monkeypatch):
 
     ids = models._persisted_session_ids_snapshot()
     assert "sid-4" in ids
+
+
+def test_stale_write_fence_refuses_older_updated_at():
+    """Gate finding: a regressive full write must not overwrite a newer row."""
+    d = _tmp_session_dir()
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+
+    newer = _sample_session_dict("sid-fence")
+    newer["updated_at"] = 2000.0
+    store.write_session(newer)
+
+    stale = _sample_session_dict("sid-fence")
+    stale["updated_at"] = 1000.0
+    stale["title"] = "stale title"
+    try:
+        store.write_session(stale)
+    except sqlite_db.StaleSessionWriteError:
+        pass
+    else:
+        raise AssertionError("stale write must be refused")
+
+    row = store.read_session("sid-fence")
+    assert row["title"] == "Test Session"
+    assert row["updated_at"] == 2000.0
+
+    # Equal updated_at is allowed (idempotent rewrite); newer is allowed.
+    store.write_session(newer)
+    newest = _sample_session_dict("sid-fence")
+    newest["updated_at"] = 3000.0
+    store.write_session(newest)
+    assert store.read_session("sid-fence")["updated_at"] == 3000.0
+
+    # force bypasses for deliberate heals.
+    stale["updated_at"] = 500.0
+    store.write_session(stale, force=True)
+    assert store.read_session("sid-fence")["updated_at"] == 500.0
+
+
+def test_save_heal_bypasses_fence_for_marked_session(monkeypatch):
+    """A marked (unreadable) session may have a row newer than its sidecar;
+    the heal save must bypass the fence."""
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", {})
+
+    sid = "sid-healfence"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict(sid)
+    payload["updated_at"] = 9000.0  # row newer than the sidecar below
+    store.write_session(payload)
+    sidecar = _sample_session_dict(sid)
+    sidecar["updated_at"] = 1000.0
+    (d / f"{sid}.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    conn = _sq.connect(str(d / "sessions.db"))
+    conn.execute("UPDATE messages SET message_json = 'bad' WHERE session_id = ?", (sid,))
+    conn.commit()
+    conn.close()
+
+    s = models.Session.load(sid)
+    assert s is not None
+    assert sid in models._SQLITE_UNREADABLE_SIDS
+
+    s.save()  # must not raise StaleSessionWriteError despite the older sidecar state
+    assert sid not in models._SQLITE_UNREADABLE_SIDS
+    assert models.Session.load(sid) is not None
+
+
+def test_incomplete_migration_does_not_activate_store(monkeypatch):
+    """Gate finding: sessions.db existence alone must not grant authority."""
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.set_meta("created_by", "migration")
+    store.set_meta("migration_complete", "0")
+    store.write_session(_sample_session_dict("sid-migrated-partial"))
+    store.close()
+
+    # Interrupted migration: the store must NOT take authority.
+    assert models._get_sqlite_session_store() is False
+
+    # Stamping completion activates it.
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.set_meta("migration_complete", "1")
+    store.close()
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+    assert models._get_sqlite_session_store()
+
+
+def test_app_created_store_is_active_by_default(monkeypatch):
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+    sqlite_db.WebUISqliteSessionDB(session_dir=d)  # creates sessions.db (created_by=app)
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+    assert models._get_sqlite_session_store()
+
+
+def test_persisted_session_ids_snapshot_tracks_sqlite_revision(monkeypatch):
+    """Gate finding: WAL commits do not move the directory mtime, so the
+    persisted-ids cache must key on the store revision instead."""
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "_PERSISTED_SESSION_IDS_CACHE", (None, None, None, frozenset()))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-r1"))
+    first = models._persisted_session_ids_snapshot()
+    assert "sid-r1" in first
+
+    # Second write: the directory mtime does not move for a WAL commit to an
+    # existing sessions.db, but the revision bump must refresh the snapshot.
+    store.write_session(_sample_session_dict("sid-r2"))
+    second = models._persisted_session_ids_snapshot()
+    assert "sid-r2" in second
+    assert second is not first
+
+    # Deletes bump the revision too.
+    store.delete_session("sid-r2")
+    third = models._persisted_session_ids_snapshot()
+    assert "sid-r2" not in third
+    assert "sid-r1" in third
 
 
 def test_index_entry_exists_for_sqlite_only(monkeypatch):

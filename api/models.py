@@ -247,7 +247,7 @@ def _cleanup_stale_tmp_files() -> None:
         pass  # SESSION_DIR may not exist yet; that's fine
 
 
-_PERSISTED_SESSION_IDS_CACHE: tuple[Path | None, int | None, frozenset[str]] = (None, None, frozenset())
+_PERSISTED_SESSION_IDS_CACHE: tuple[Path | None, int | None, int | None, frozenset[str]] = (None, None, None, frozenset())
 
 
 def _persisted_session_ids_snapshot() -> frozenset[str]:
@@ -265,8 +265,16 @@ def _persisted_session_ids_snapshot() -> frozenset[str]:
         dir_mtime_ns = SESSION_DIR.stat().st_mtime_ns
     except Exception:
         dir_mtime_ns = None
-    cached_dir, cached_mtime_ns, cached_ids = _PERSISTED_SESSION_IDS_CACHE
-    if cached_dir == SESSION_DIR and cached_mtime_ns == dir_mtime_ns:
+    cached_dir, cached_mtime_ns, cached_rev, cached_ids = _PERSISTED_SESSION_IDS_CACHE
+    # SQLite commits advance the store revision without moving the session
+    # directory mtime, so mtime alone cannot invalidate this cache once the
+    # store is active — key it on (dir, mtime, store revision).
+    store = _get_sqlite_session_store()
+    try:
+        rev = store.get_revision() if store else None
+    except Exception:
+        rev = None
+    if cached_dir == SESSION_DIR and cached_mtime_ns == dir_mtime_ns and cached_rev == rev:
         return cached_ids
     try:
         ids = {
@@ -278,13 +286,12 @@ def _persisted_session_ids_snapshot() -> frozenset[str]:
         ids = set()
     # Include SQLite-backed sessions so the sidebar does not prune them.
     try:
-        store = _get_sqlite_session_store()
         if store:
             ids.update(s.get('session_id') for s in store.list_sessions() if s.get('session_id'))
     except Exception:
         pass
     ids = frozenset(ids)
-    _PERSISTED_SESSION_IDS_CACHE = (SESSION_DIR, dir_mtime_ns, ids)
+    _PERSISTED_SESSION_IDS_CACHE = (SESSION_DIR, dir_mtime_ns, rev, ids)
     return ids
 
 
@@ -1269,7 +1276,10 @@ def _get_sqlite_session_store():
         return _sqlite_session_store_instance
     db_path = SESSION_DIR / "sessions.db"
     if db_path.exists():
-        _sqlite_session_store_instance = WebUISqliteSessionDB(session_dir=SESSION_DIR)
+        store = WebUISqliteSessionDB(session_dir=SESSION_DIR)
+        # Durable cutover: a database left behind by an interrupted migration
+        # carries no authority until migration_complete is stamped.
+        _sqlite_session_store_instance = store if store.is_active() else False
     else:
         _sqlite_session_store_instance = False
     return _sqlite_session_store_instance
@@ -1553,7 +1563,10 @@ class Session:
             payload.setdefault("tool_calls", [])
             payload.setdefault("context_messages", [])
             payload.setdefault("anchor_activity_scenes", {})
-            store.write_session(payload)
+            # force only for a deliberate heal of a row marked unreadable:
+            # its persisted updated_at may be newer than the sidecar's, and
+            # the stale-writer fence would otherwise refuse the rewrite.
+            store.write_session(payload, force=self.session_id in _SQLITE_UNREADABLE_SIDS)
             _SQLITE_UNREADABLE_SIDS.pop(self.session_id, None)
             if not skip_index:
                 _write_session_index(updates=[self])

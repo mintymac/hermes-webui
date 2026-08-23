@@ -81,6 +81,11 @@ def main() -> int:
 
     print(f"Found {len(json_files)} JSON session files in {session_dir}")
     db = WebUISqliteSessionDB(session_dir=session_dir, db_name=args.db_name)
+    # Durable cutover fencing: until verification completes and the marker is
+    # stamped, is_active() keeps the WebUI on the JSON sidecars even if this
+    # sessions.db is left behind by an interruption.
+    db.set_meta("created_by", "migration")
+    db.set_meta("migration_complete", "0")
 
     t0 = time.time()
     migrated = 0
@@ -105,6 +110,10 @@ def main() -> int:
     if failed:
         print(f"FAILURES: {failed}")
         return 1
+
+    # Verification passed: stamp the cutover marker BEFORE moving sidecars,
+    # so a crash here leaves the store inactive and the sidecars untouched.
+    db.set_meta("migration_complete", "1")
 
     if args.commit:
         backup_dir = session_dir / "json-backup"
