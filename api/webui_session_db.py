@@ -83,6 +83,8 @@ _UNSAFE_FIELDS = frozenset({"session_id", "messages", "tool_calls", "message_cou
 class WebUIJsonSessionDB:
     """Small SessionDB-like facade over existing WebUI session JSON files."""
 
+    backend = "json"
+
     def __init__(self, session_dir: Path | str | None = None):
         self._session_dir = Path(session_dir).expanduser().resolve() if session_dir else None
 

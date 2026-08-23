@@ -1228,6 +1228,151 @@ def test_clear_route_verifies_persisted_state_via_store(monkeypatch):
     assert persisted.get("pending_user_message") is None
 
 
+def test_ephemeral_cancel_cleanup_deletes_store_row(monkeypatch):
+    """DB-only ephemeral cancel cleanup must delete the row (gate finding)."""
+    import api.streaming as streaming
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-ephem"))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+    monkeypatch.setattr(streaming, "SESSION_DIR", d)
+
+    class FakeEphemeralSession:
+        session_id = "sid-ephem"
+        path = d / "sid-ephem.json"
+        active_stream_id = "live"
+        pending_user_message = "x"
+        pending_attachments = []
+        pending_started_at = 1.0
+        pending_user_source = None
+
+    streaming._cleanup_ephemeral_cancelled_turn(FakeEphemeralSession())
+    assert store.session_exists("sid-ephem") is False
+
+
+def test_ephemeral_cancel_cleanup_retains_row_on_store_failure(monkeypatch):
+    """Failed authoritative deletion retains the record for retry."""
+    import sqlite3 as _sq
+
+    import api.streaming as streaming
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-ephem2"))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+    monkeypatch.setattr(streaming, "SESSION_DIR", d)
+
+    def _boom(sid_):
+        raise _sq.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "delete_session", _boom)
+
+    class FakeEphemeralSession:
+        session_id = "sid-ephem2"
+        path = d / "sid-ephem2.json"
+        active_stream_id = "live"
+        pending_user_message = "x"
+        pending_attachments = []
+        pending_started_at = 1.0
+        pending_user_source = None
+
+    streaming._cleanup_ephemeral_cancelled_turn(FakeEphemeralSession())
+    assert store.session_exists("sid-ephem2") is True
+
+
+def test_recovered_workspace_binding_patches_store_row(monkeypatch):
+    """DB-only workspace recovery must patch the row, not demand a sidecar."""
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-ws"))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    s = models.Session.load("sid-ws")
+    assert s is not None
+    models.persist_recovered_workspace_binding(
+        s, "/recovered/ws", expected_workspace=s.workspace
+    )
+    assert store.read_metadata_only("sid-ws")["workspace"] == "/recovered/ws"
+
+    # A mismatched expected_workspace fails closed, like the sidecar path.
+    try:
+        models.persist_recovered_workspace_binding(
+            s, "/another/ws", expected_workspace="/different"
+        )
+    except models.WorkspaceBindingPersistenceError:
+        pass
+    else:
+        raise AssertionError("workspace-changed mismatch must fail closed")
+
+
+def test_sessions_cleanup_ghost_sweep_keeps_sqlite_rows(monkeypatch):
+    """DB-only index rows are live sessions, not ghosts (gate finding)."""
+    import api.routes as routes
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    monkeypatch.setattr(routes, "SESSION_INDEX_FILE", d / "_index.json")
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-live-db")
+    payload["title"] = "Real DB Session"
+    store.write_session(payload)
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    index_file = d / "_index.json"
+    index_file.write_text(
+        json.dumps(
+            [
+                {"session_id": "sid-live-db", "title": "Real DB Session"},
+                {"session_id": "sid-ghost", "title": "Ghost"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    captured = {}
+    monkeypatch.setattr(
+        routes, "j", lambda handler, payload, **kwargs: captured.update(payload) or True
+    )
+    handler = SimpleNamespace(_safe_webui_print=lambda *_a, **_k: None)
+    routes._handle_sessions_cleanup(handler, {}, zero_only=False)
+
+    survivors = json.loads(index_file.read_text(encoding="utf-8"))
+    survivor_ids = [e["session_id"] for e in survivors]
+    assert "sid-live-db" in survivor_ids  # DB-only row is live
+    assert "sid-ghost" not in survivor_ids  # real ghost removed
+    assert store.session_exists("sid-live-db") is True
+
+
+def test_sessions_cleanup_removes_db_only_zero_message_untitled(monkeypatch):
+    """Phase 1b: DB-only zero-message Untitled sessions are cleaned."""
+    import api.routes as routes
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-zero")
+    payload["title"] = "Untitled"
+    payload["messages"] = []
+    store.write_session(payload)
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    captured = {}
+    monkeypatch.setattr(
+        routes, "j", lambda handler, payload, **kwargs: captured.update(payload) or True
+    )
+    handler = SimpleNamespace(_safe_webui_print=lambda *_a, **_k: None)
+    routes._handle_sessions_cleanup(handler, {}, zero_only=False)
+
+    assert store.session_exists("sid-zero") is False
+
+
 def _drive_delete_post(monkeypatch, body):
     """Run POST /api/session/delete through routes.handle_post (CSRF bypassed,
     JSON responders captured) and return the captured response."""

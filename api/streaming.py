@@ -2126,8 +2126,24 @@ def _cleanup_ephemeral_cancelled_turn(session) -> None:
     session.pending_attachments = []
     session.pending_started_at = None
     session.pending_user_source = None
+    from api.models import delete_session_record
+
+    _sid = str(getattr(session, "session_id", "") or "")
+    try:
+        delete_session_record(_sid)
+    except Exception:
+        # Retain retryable ownership: a failed authoritative deletion must
+        # not masquerade as a successful cleanup (or the row leaks while the
+        # index prune assumes success).
+        logger.warning(
+            "Failed to delete ephemeral cancelled session %s from store; retaining for retry",
+            _sid,
+            exc_info=True,
+        )
+        return
     try:
         import pathlib
+
         pathlib.Path(session.path).unlink(missing_ok=True)
     except Exception:
         logger.debug("Failed to clean up ephemeral cancelled session", exc_info=True)
@@ -10187,10 +10203,17 @@ def _run_agent_streaming(
                 if _checkpoint_stop is not None:
                     _checkpoint_stop.set()
                 try:
+                    from api.models import delete_session_record
+
+                    delete_session_record(str(getattr(s, "session_id", "") or ""))
                     import pathlib
+
                     pathlib.Path(s.path).unlink(missing_ok=True)
                 except Exception:
-                    pass
+                    logger.warning(
+                        "Failed to remove ephemeral session record; retaining for retry",
+                        exc_info=True,
+                    )
                 return  # skip all normal persistence for ephemeral sessions
             if _checkpoint_stop is not None:
                 _checkpoint_stop.set()

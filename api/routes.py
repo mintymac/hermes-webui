@@ -21572,6 +21572,34 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
         except Exception:
             logger.debug("Failed to clean up session file %s", p)
 
+    # Phase 1b: SQL-backed sessions (no sidecar) — same predicates via the
+    # canonical store so DB-only zero-message sessions are cleaned too.
+    try:
+        from api.models import get_session_store
+
+        _store = get_session_store()
+        if _store.backend != "json":
+            for _meta in _store.list_sessions():
+                _sid = str(_meta.get("session_id") or "").strip()
+                if not _sid or _sid in phase1_removed_ids:
+                    continue
+                try:
+                    s = Session.load(_sid)
+                    if zero_only:
+                        should_delete = s and len(s.messages) == 0
+                    else:
+                        should_delete = s and s.title == "Untitled" and len(s.messages) == 0
+                    if should_delete:
+                        with LOCK:
+                            SESSIONS.pop(_sid, None)
+                        _store.delete_session(_sid)
+                        cleaned += 1
+                        phase1_removed_ids.add(_sid)
+                except Exception:
+                    logger.debug("Failed to clean up SQL-backed session %s", _sid)
+    except Exception:
+        logger.debug("Store unavailable during sessions cleanup", exc_info=True)
+
     phase1_touched = bool(cleaned)
     phase2_rewrote_index = False
 
@@ -21600,6 +21628,20 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
                         for p in SESSION_DIR.glob("*.json")
                         if not p.name.startswith("_")
                     }
+                    # SQL-backed sessions have no sidecar; their index rows
+                    # are live, not ghosts.
+                    try:
+                        from api.models import get_session_store
+
+                        _store = get_session_store()
+                        if _store.backend != "json":
+                            live_ids |= {
+                                str(m.get("session_id"))
+                                for m in _store.list_sessions()
+                                if m.get("session_id")
+                            }
+                    except Exception:
+                        logger.debug("Store unavailable during ghost sweep", exc_info=True)
                     with LOCK:
                         in_memory_ids = set(SESSIONS.keys())
 
@@ -21793,24 +21835,26 @@ def _handle_background(handler, body):
                 complete_background(parent_sid, task_id, _answer or "(no answer produced)")
             except Exception:
                 complete_background(parent_sid, task_id, "(background task failed)")
-            # Best-effort cleanup of the hidden bg session file so it doesn't
-            # clutter the sidebar or SESSION_DIR. The index is pruned on the
-            # next rebuild via _index_entry_exists().
+            # Fail-retained cleanup: the authoritative store row must go
+            # FIRST. If it cannot, keep the whole record (including any
+            # sidecar) so a later sweep retries — never report a cleanup
+            # that silently leaks the row while the index prune assumes
+            # success.
             try:
-                (SESSION_DIR / f"{bg_sid}.json").unlink(missing_ok=True)
-            except Exception:
-                pass
-            # With the SQLite store active the bg session lives in sessions.db
-            # (no sidecar); _index_entry_exists() would keep it indexed
-            # forever, surfacing hidden bg sessions in the sidebar.
-            try:
-                from api.models import _get_sqlite_session_store
+                from api.models import delete_session_record
 
-                _bg_store = _get_sqlite_session_store()
-                if _bg_store:
-                    _bg_store.delete_session(bg_sid)
+                delete_session_record(bg_sid)
             except Exception:
-                pass
+                logger.warning(
+                    "Failed to delete bg session %s from store; retaining for retry",
+                    bg_sid,
+                    exc_info=True,
+                )
+            else:
+                try:
+                    (SESSION_DIR / f"{bg_sid}.json").unlink(missing_ok=True)
+                except Exception:
+                    pass
         except Exception:
             try:
                 complete_background(parent_sid, task_id, "(background task failed)")

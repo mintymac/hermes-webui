@@ -266,12 +266,12 @@ def _persisted_session_ids_snapshot() -> frozenset[str]:
     except Exception:
         dir_mtime_ns = None
     cached_dir, cached_mtime_ns, cached_rev, cached_ids = _PERSISTED_SESSION_IDS_CACHE
-    # SQLite commits advance the store revision without moving the session
-    # directory mtime, so mtime alone cannot invalidate this cache once the
-    # store is active — key it on (dir, mtime, store revision).
-    store = _get_sqlite_session_store()
+    # SQL-backend commits advance the store revision without moving the
+    # session directory mtime, so mtime alone cannot invalidate this cache
+    # once a store is active — key it on (dir, mtime, store revision).
+    store = get_session_store()
     try:
-        rev = store.get_revision() if store else None
+        rev = store.get_revision() if store.backend != "json" else None
     except Exception:
         rev = None
     if cached_dir == SESSION_DIR and cached_mtime_ns == dir_mtime_ns and cached_rev == rev:
@@ -284,9 +284,9 @@ def _persisted_session_ids_snapshot() -> frozenset[str]:
         }
     except Exception:
         ids = set()
-    # Include SQLite-backed sessions so the sidebar does not prune them.
+    # Include SQL-backed sessions so the sidebar does not prune them.
     try:
-        if store:
+        if store.backend != "json":
             ids.update(s.get('session_id') for s in store.list_sessions() if s.get('session_id'))
     except Exception:
         pass
@@ -1255,19 +1255,49 @@ _sqlite_session_store_instance = None
 # the row reads healthy again.
 _SQLITE_UNREADABLE_SIDS: dict[str, object] = {}
 
+_pg_session_store_instance = None
+
+
 def get_session_store():
     """Return the active session store backend (api.session_store.SessionStore).
 
-    SQLite when an active sessions.db cutover exists, otherwise the JSON
-    sidecar adapter. Callers that only need the canonical CRUD surface should
-    use this instead of branching on the backend.
+    Selection order: a configured Postgres DSN (runtime substitution,
+    HERMES_SESSION_STORE_PG_DSN), else an active SQLite cutover, else the
+    JSON sidecar adapter. Callers branch on ``store.backend`` only for
+    JSON-vs-SQL capability differences, never on the concrete class.
     """
+    global _pg_session_store_instance
+    if _pg_session_store_instance is not None:
+        return _pg_session_store_instance
+    _pg_dsn = os.environ.get("HERMES_SESSION_STORE_PG_DSN")
+    if _pg_dsn:
+        from api.webui_session_postgres import WebUIPostgresSessionDB
+
+        _pg_session_store_instance = WebUIPostgresSessionDB(_pg_dsn)
+        return _pg_session_store_instance
     store = _get_sqlite_session_store()
     if store:
         return store
     from api.webui_session_db import WebUIJsonSessionDB
 
     return WebUIJsonSessionDB(session_dir=SESSION_DIR)
+
+
+def delete_session_record(sid: str) -> bool:
+    """Remove a session's authoritative record via the canonical store.
+
+    SQL backends delete the row (and transcript) — and RAISE on failure so
+    callers can retain retryable ownership instead of reporting a cleanup
+    that silently leaked the row. The JSON backend unlinks the sidecar.
+    Sidecar unlinks for SQL-backed cleanups are left to callers
+    (``missing_ok=True``).
+    """
+    store = get_session_store()
+    if store.backend == "json":
+        return store.delete_session(sid)
+    if store.session_exists(sid):
+        store.delete_session(sid)
+    return True
 
 
 def _get_sqlite_session_store():
@@ -1490,7 +1520,7 @@ class Session:
             raise TypeError("fields must be a dict")
         if not is_safe_session_id(self.session_id):
             raise ValueError(f"Unsafe session_id {self.session_id!r}")
-        store = _get_sqlite_session_store()
+        store = get_session_store()
         # The store being active does not mean THIS session has a SQLite row:
         # sessions.db can exist while an unmigrated session lives only in its
         # JSON sidecar (Session.load() falls back to the sidecar). Routing
@@ -1498,7 +1528,7 @@ class Session:
         # follow-up lookup raises KeyError, losing the draft — so only take
         # the SQLite path when the row is actually there.
         if (
-            store
+            store.backend != "json"
             and self.session_id not in _SQLITE_UNREADABLE_SIDS
             and store.session_exists(self.session_id)
         ):
@@ -1555,9 +1585,9 @@ class Session:
                 f"Reload with metadata_only=False before mutating state. "
                 f"See #1558."
             )
-        # ── SQLite fast path ─────────────────────────────────────────────
-        store = _get_sqlite_session_store()
-        if store:
+        # ── SQL fast path (any SessionStore backend with a generation CAS) ─
+        store = get_session_store()
+        if store.backend != "json":
             if touch_updated_at:
                 self.updated_at = time.time()
             payload = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
@@ -1757,10 +1787,10 @@ class Session:
         # ``reachy-voice-*``); allow those but still reject dots/slashes.
         if not is_safe_session_id(sid):
             return None
-        # ── SQLite fast path ─────────────────────────────────────────────
-        store = _get_sqlite_session_store()
+        # ── SQL fast path ─────────────────────────────────────────────
+        store = get_session_store()
         sqlite_read_failed = False
-        if store and sid in _SQLITE_UNREADABLE_SIDS:
+        if store.backend != "json" and sid in _SQLITE_UNREADABLE_SIDS:
             # While marked, the sidecar is authoritative for reads AND
             # writes: save_metadata() routes drafts there, so loads must
             # read it too, or drafts saved during the outage would be
@@ -1768,7 +1798,7 @@ class Session:
             # row with the (sidecar-loaded) in-memory state, or below when
             # the sidecar itself is gone and the row reads healthy again.
             pass
-        elif store:
+        elif store.backend != "json":
             try:
                 data = store.read_session(sid)
             except Exception:
@@ -1792,7 +1822,7 @@ class Session:
         # ── JSON sidecar fallback ────────────────────────────────────────
         p = SESSION_DIR / f'{sid}.json'
         if not p.exists():
-            if store and sid in _SQLITE_UNREADABLE_SIDS:
+            if store.backend != "json" and sid in _SQLITE_UNREADABLE_SIDS:
                 # Sidecar vanished while marked; if the row reads healthy
                 # again there is nothing left to protect — drop the mark
                 # and use the row.
@@ -1869,11 +1899,11 @@ class Session:
         # path separators and traversal dots are not.
         if not is_safe_session_id(sid):
             return None
-        # SQLite fast path: metadata lives in the sessions table.
+        # SQL fast path: metadata lives in the sessions table.
         # Marked sids read the sidecar instead (see _SQLITE_UNREADABLE_SIDS).
         try:
-            store = _get_sqlite_session_store()
-            if store and sid not in _SQLITE_UNREADABLE_SIDS:
+            store = get_session_store()
+            if store.backend != "json" and sid not in _SQLITE_UNREADABLE_SIDS:
                 data = store.read_metadata_only(sid)
                 if data is not None:
                     data['messages'] = []
@@ -5915,7 +5945,31 @@ def persist_recovered_workspace_binding(
     path = SESSION_DIR / f"{sid}.json"
     lock = _get_session_agent_lock(sid)
     with lock:
-        if not path.exists():
+        _store_patched = False
+        store = _get_sqlite_session_store()
+        if store and store.session_exists(sid):
+            # Migrated sessions have no sidecar to patch: apply the same
+            # compare-and-replace to the row via the canonical metadata write.
+            try:
+                meta = store.read_metadata_only(sid) or {}
+            except Exception as exc:
+                raise WorkspaceBindingPersistenceError(
+                    "Failed to persist recovered workspace: unreadable session row"
+                ) from exc
+            current = str(meta.get("workspace") or "")
+            if current != resolved:
+                if current != expected:
+                    raise WorkspaceBindingPersistenceError(
+                        "Failed to persist recovered workspace: session workspace changed"
+                    )
+                try:
+                    store.update_metadata(sid, {"workspace": resolved})
+                except Exception as exc:
+                    raise WorkspaceBindingPersistenceError(
+                        "Failed to persist recovered workspace"
+                    ) from exc
+            _store_patched = True
+        if not _store_patched and not path.exists():
             # Recovery only repairs an existing WebUI sidecar. Creating a new
             # sidecar here can resurrect a session that was deleted after the
             # recovery decision but before this lock was acquired.
@@ -5923,40 +5977,41 @@ def persist_recovered_workspace_binding(
                 "Failed to persist recovered workspace: session sidecar is missing"
             )
 
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            raise WorkspaceBindingPersistenceError(
-                "Failed to persist recovered workspace: unreadable session sidecar"
-            ) from exc
-        if not isinstance(payload, dict):
-            raise WorkspaceBindingPersistenceError(
-                "Failed to persist recovered workspace: invalid session sidecar"
-            )
-        current = str(payload.get("workspace") or "")
-        if current != resolved:
-            if current != expected:
-                raise WorkspaceBindingPersistenceError(
-                    "Failed to persist recovered workspace: session workspace changed"
-                )
-            payload["workspace"] = resolved
-            tmp = path.with_suffix(
-                f".tmp.{os.getpid()}.{threading.current_thread().ident}"
-            )
+        if not _store_patched:
             try:
-                with open(tmp, "w", encoding="utf-8") as handle:
-                    json.dump(payload, handle, ensure_ascii=False, indent=2)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                _safe_replace(tmp, path)
+                payload = json.loads(path.read_text(encoding="utf-8"))
             except Exception as exc:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except Exception:
-                    pass
                 raise WorkspaceBindingPersistenceError(
-                    "Failed to persist recovered workspace"
+                    "Failed to persist recovered workspace: unreadable session sidecar"
                 ) from exc
+            if not isinstance(payload, dict):
+                raise WorkspaceBindingPersistenceError(
+                    "Failed to persist recovered workspace: invalid session sidecar"
+                )
+            current = str(payload.get("workspace") or "")
+            if current != resolved:
+                if current != expected:
+                    raise WorkspaceBindingPersistenceError(
+                        "Failed to persist recovered workspace: session workspace changed"
+                    )
+                payload["workspace"] = resolved
+                tmp = path.with_suffix(
+                    f".tmp.{os.getpid()}.{threading.current_thread().ident}"
+                )
+                try:
+                    with open(tmp, "w", encoding="utf-8") as handle:
+                        json.dump(payload, handle, ensure_ascii=False, indent=2)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    _safe_replace(tmp, path)
+                except Exception as exc:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    raise WorkspaceBindingPersistenceError(
+                        "Failed to persist recovered workspace"
+                    ) from exc
 
         session.workspace = resolved
         with LOCK:

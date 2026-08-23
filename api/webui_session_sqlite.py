@@ -299,9 +299,18 @@ class WebUISqliteSessionDB:
     so it can be swapped in without changing route code.
     """
 
-    def __init__(self, session_dir: Path | str | None = None, db_name: str = "sessions.db"):
+    backend = "sqlite"
+
+    def __init__(
+        self,
+        session_dir: Path | str | None = None,
+        db_name: str = "sessions.db",
+        *,
+        created_by: str = "app",
+    ):
         self._session_dir = Path(session_dir).expanduser().resolve() if session_dir else None
         self._db_name = db_name
+        self._created_by = created_by
         self._local = threading.local()
         self._ensure_schema()
 
@@ -345,10 +354,23 @@ class WebUISqliteSessionDB:
         # migration script overwrites with 'migration' + migration_complete.
         if conn.execute("SELECT 1 FROM meta WHERE key = 'created_by'").fetchone() is None:
             has_rows = conn.execute("SELECT 1 FROM sessions LIMIT 1").fetchone() is not None
-            conn.execute(
-                "INSERT INTO meta (key, value) VALUES ('created_by', ?)",
-                ("legacy" if has_rows else "app",),
-            )
+            if self._created_by == "migration":
+                # Staged from creation: a database the migration script opens
+                # is incomplete until the script publishes it, even if this
+                # process dies before writing a single row.
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('created_by', ?)",
+                    ("migration",),
+                )
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('migration_complete', ?)",
+                    ("0",),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('created_by', ?)",
+                    ("legacy" if has_rows else "app",),
+                )
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
 
@@ -378,17 +400,24 @@ class WebUISqliteSessionDB:
             return int(time.time_ns())
 
     def is_active(self) -> bool:
-        """Durable cutover check: a database the migration script started but
-        never completed must not take authority. App-created and legacy
-        (pre-marker) databases are always active."""
+        """Durable cutover check, fail-closed.
+
+        Authority requires readable, recognizable markers: an app-created or
+        legacy (pre-marker) database is active; a migration database is only
+        active once migration_complete=1. Unreadable, missing, or unknown
+        markers deny authority.
+        """
         try:
             rows = self._conn().execute("SELECT key, value FROM meta").fetchall()
             meta = {row["key"]: row["value"] for row in rows}
         except Exception:
-            return True  # pre-meta databases were app-created
-        if meta.get("created_by") == "migration" and meta.get("migration_complete") != "1":
             return False
-        return True
+        created_by = meta.get("created_by")
+        if created_by == "migration":
+            return meta.get("migration_complete") == "1"
+        if created_by in ("app", "legacy"):
+            return True
+        return False
 
     def set_meta(self, key: str, value: str) -> None:
         conn = self._conn()

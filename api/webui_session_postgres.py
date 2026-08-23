@@ -153,6 +153,8 @@ CREATE TABLE IF NOT EXISTS meta (
 class WebUIPostgresSessionDB:
     """SessionStore implementation backed by PostgreSQL."""
 
+    backend = "postgres"
+
     def __init__(self, dsn: str):
         import psycopg
 

@@ -46,19 +46,17 @@ def _pg_store():
     dsn = os.environ.get("HERMES_TEST_PG_DSN")
     if not dsn:
         pytest.skip("HERMES_TEST_PG_DSN not set")
-    try:
-        from api.webui_session_postgres import WebUIPostgresSessionDB
+    # A CONFIGURED backend that fails to come up is a test failure, not a
+    # skip: silently dropping the backend would hide contract violations.
+    from api.webui_session_postgres import WebUIPostgresSessionDB
 
-        store = WebUIPostgresSessionDB(dsn)
-        # The container database persists across tests: start clean.
-        conn = store._conn()
-        with conn:
-            conn.execute(
-                "TRUNCATE sessions, messages, tool_calls, context_messages, anchor_scenes"
-            )
-        return store
-    except Exception as e:
-        pytest.skip(f"Postgres unavailable: {e}")
+    store = WebUIPostgresSessionDB(dsn)
+    conn = store._conn()
+    with conn:
+        conn.execute(
+            "TRUNCATE sessions, messages, tool_calls, context_messages, anchor_scenes"
+        )
+    return store
 
 
 @pytest.fixture(params=["json", "sqlite", "postgres"])
@@ -194,6 +192,60 @@ def test_null_key_presence(sql_store):
     reloaded = sql_store.read_session("c10")
     assert reloaded["personality"] == "set"
     assert "threshold_tokens" in reloaded and reloaded["threshold_tokens"] is None
+
+
+def test_session_model_runs_on_postgres_backend(monkeypatch, tmp_path):
+    """Runtime substitution at the model layer: Session.save/load against
+    the Postgres backend with generation CAS, index, and reloads."""
+    import os as _os
+
+    dsn = _os.environ.get("HERMES_TEST_PG_DSN")
+    if not dsn:
+        pytest.skip("HERMES_TEST_PG_DSN not set")
+
+    import api.models as models
+    from api.webui_session_postgres import WebUIPostgresSessionDB
+
+    store = WebUIPostgresSessionDB(dsn)
+    conn = store._conn()
+    with conn:
+        conn.execute(
+            "TRUNCATE sessions, messages, tool_calls, context_messages, anchor_scenes"
+        )
+    monkeypatch.setattr(models, "_pg_session_store_instance", store)
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", tmp_path / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", {})
+
+    s = models.Session(
+        session_id="pg-model", title="PG", messages=[{"role": "user", "content": "hi"}]
+    )
+    s.save()
+    assert s._persisted_generation == 1
+
+    loaded = models.Session.load("pg-model")
+    assert loaded is not None
+    assert loaded.title == "PG"
+    assert loaded._persisted_generation == 1
+
+    loaded.title = "PG2"
+    loaded.save()
+    assert store.read_session("pg-model")["generation"] == 2
+
+    stale = models.Session(
+        session_id="pg-model",
+        title="stale",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    stale._persisted_generation = 1
+    try:
+        stale.save()
+    except StaleSessionWriteError:
+        pass
+    else:
+        raise AssertionError("stale model-layer writer must be rejected on PG")
+
+    assert store.read_session("pg-model")["title"] == "PG2"
 
 
 def test_cutover_marker_blocks_incomplete_migration(sql_store):
