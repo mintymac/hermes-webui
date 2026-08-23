@@ -15227,13 +15227,33 @@ def handle_post(handler, parsed) -> bool:
         if not session_lock.acquire(timeout=5):
             return bad(handler, "Session busy, try again", 503)
         try:
-            with LOCK:
-                SESSIONS.pop(sid, None)
             try:
                 p = (SESSION_DIR / f"{sid}.json").resolve()
                 p.relative_to(SESSION_DIR.resolve())
             except Exception:
                 return bad(handler, "Invalid session_id", 400)
+            # Fail-closed at the store boundary: when SQLite holds this
+            # session, the authoritative row must be deleted FIRST. Reporting
+            # success after a failed SQLite delete would leave the transcript
+            # on disk and let a later index rebuild resurrect the session —
+            # so any store error aborts the delete with a 500 before any
+            # sidecar/index/tombstone state is touched.
+            from api.models import _get_sqlite_session_store
+
+            _session_store = _get_sqlite_session_store()
+            if _session_store:
+                try:
+                    if _session_store.session_exists(sid):
+                        _session_store.delete_session(sid)
+                except Exception:
+                    logger.warning(
+                        "Failed to delete SQLite session %s; refusing to report success",
+                        sid,
+                        exc_info=True,
+                    )
+                    return bad(handler, "Failed to delete session; please retry", 500)
+            with LOCK:
+                SESSIONS.pop(sid, None)
             sidecar_deleted = False
             try:
                 p.unlink(missing_ok=True)
@@ -15244,18 +15264,6 @@ def handle_post(handler, parsed) -> bool:
                 prune_session_from_index(sid)
             except Exception:
                 logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
-            # Migrated sessions have no JSON sidecar: remove the SQLite rows
-            # too, or the row survives in sessions.db and the next full index
-            # rebuild resurrects the deleted session in the sidebar (with its
-            # transcript still on disk).
-            try:
-                from api.models import _get_sqlite_session_store
-
-                _session_store = _get_sqlite_session_store()
-                if _session_store:
-                    _session_store.delete_session(sid)
-            except Exception:
-                logger.debug("Failed to delete SQLite rows for session %s", sid, exc_info=True)
             try:
                 p.with_suffix('.json.bak').unlink(missing_ok=True)
             except Exception:
