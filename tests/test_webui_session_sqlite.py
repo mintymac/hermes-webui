@@ -925,6 +925,115 @@ def test_pre_compression_snapshot_check_reads_sqlite_store(monkeypatch):
     assert routes._is_pre_compression_snapshot_id("missing_parent") is False
 
 
+def test_preserve_pre_compression_snapshot_marks_sqlite_only_session(tmp_path, monkeypatch):
+    """Gate finding: compression snapshot preservation must not return early
+    just because the old session has no JSON sidecar."""
+    import api.streaming as streaming
+
+    monkeypatch.setattr(streaming, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", tmp_path / "_index.json")
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=tmp_path)
+    old = _sample_session_dict("old_sqlite")
+    old["messages"] = [{"role": "user", "content": f"m{i}"} for i in range(5)]
+    store.write_session(old)
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    # Continuation session holds fewer messages than the stored old session,
+    # so the load-and-mark branch runs and must stamp the marker in the store.
+    s = models.Session(session_id="new_cont")
+    s.messages = [{"role": "user", "content": "x"}]
+    s.parent_session_id = "original_parent"
+
+    streaming._preserve_pre_compression_snapshot(s, "old_sqlite")
+
+    meta = store.read_metadata_only("old_sqlite")
+    assert meta is not None
+    assert bool(meta["pre_compression_snapshot"]) is True
+    # The fuller stored transcript is untouched.
+    assert len(store.read_session("old_sqlite")["messages"]) == 5
+
+
+def test_preserve_pre_compression_snapshot_rewrites_sqlite_snapshot_from_memory(
+    tmp_path, monkeypatch
+):
+    """Rewrite branch: in-memory messages are newer than the stored row."""
+    import api.streaming as streaming
+
+    monkeypatch.setattr(streaming, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", tmp_path / "_index.json")
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=tmp_path)
+    old = _sample_session_dict("old_sqlite2")
+    old["messages"] = [{"role": "user", "content": "m0"}]
+    store.write_session(old)
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    s = models.Session(session_id="new_cont2")
+    s.messages = [{"role": "user", "content": f"m{i}"} for i in range(5)]
+    s.parent_session_id = "original_parent"
+
+    streaming._preserve_pre_compression_snapshot(s, "old_sqlite2")
+
+    full = store.read_session("old_sqlite2")
+    assert full is not None
+    assert len(full["messages"]) == 5
+    assert full["pre_compression_snapshot"] is True
+    # Continuation state restored.
+    assert s.session_id == "new_cont2"
+    assert s.pre_compression_snapshot is False
+
+
+def _drive_clear_post(monkeypatch, body):
+    """Run POST /api/session/clear through routes.handle_post."""
+    import api.routes as routes
+
+    captured = {}
+    monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
+    monkeypatch.setattr(routes, "read_body", lambda handler: body)
+    monkeypatch.setattr(
+        routes,
+        "bad",
+        lambda handler, msg, status=400, extra_headers=None: captured.update(
+            error=msg, status=status
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda handler, payload, status=200, extra_headers=None, pretty=True: captured.update(
+            payload=payload, status=status
+        )
+        or True,
+    )
+    handler = SimpleNamespace(command="POST", _safe_webui_print=lambda *_a, **_k: None)
+    assert routes.handle_post(handler, SimpleNamespace(path="/api/session/clear")) is True
+    return captured
+
+
+def test_clear_route_verifies_persisted_state_via_store(monkeypatch):
+    """Clear verification reads the active store, not a missing sidecar."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+
+    sid = "sid-clear"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    captured = _drive_clear_post(monkeypatch, {"session_id": sid})
+    assert captured.get("payload", {}).get("ok") is True, captured
+
+    persisted = store.read_session(sid)
+    assert persisted is not None
+    assert persisted["messages"] == []
+    assert persisted.get("active_stream_id") is None
+    assert persisted.get("pending_user_message") is None
+
+
 def _drive_delete_post(monkeypatch, body):
     """Run POST /api/session/delete through routes.handle_post (CSRF bypassed,
     JSON responders captured) and return the captured response."""

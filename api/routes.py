@@ -15404,7 +15404,12 @@ def handle_post(handler, parsed) -> bool:
             s.save()
             persisted_clear = False
             try:
-                persisted = json.loads(s.path.read_text(encoding="utf-8"))
+                # Verify through the canonical store: migrated sessions have
+                # no sidecar to read back, so s.path would fail the
+                # verification with a warning even though the clear persisted.
+                from api.models import get_session_store
+
+                persisted = get_session_store().read_session(sid) or {}
                 persisted_clear = (
                     persisted.get("messages") == []
                     and persisted.get("context_messages") == []

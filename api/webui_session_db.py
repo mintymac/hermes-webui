@@ -146,6 +146,50 @@ class WebUIJsonSessionDB:
         """Set the archived metadata flag without touching transcript messages."""
         return self.update_metadata(sid, {"archived": bool(archived)})
 
+    def read_metadata_only(self, sid: str) -> dict[str, Any] | None:
+        """Metadata-only view of the sidecar (canonical-store contract)."""
+        data = self.read_session(sid)
+        if data is None:
+            return None
+        row = self._metadata_row(str(data.get("session_id") or sid), data)
+        return row
+
+    def session_exists(self, sid: str) -> bool:
+        path = self._path_for_sid(sid)
+        return path is not None and path.exists()
+
+    def delete_session(self, sid: str) -> bool:
+        """Remove the sidecar (and stale .bak). True if a file existed."""
+        path = self._path_for_sid(sid)
+        if path is None:
+            return False
+        existed = path.exists()
+        try:
+            path.unlink(missing_ok=True)
+            path.with_suffix(".json.bak").unlink(missing_ok=True)
+        except OSError:
+            return False
+        return existed
+
+    def get_revision(self) -> int:
+        """JSON freshness signal: the session directory mtime in ns.
+
+        Sidecar creation/deletion bumps the parent directory mtime; content
+        writes go through atomic replace, which also bumps it. This matches
+        the cache-invalidation signal models has always used for JSON.
+        """
+        try:
+            return int(getattr(self.session_dir.stat(), "st_mtime_ns", 0))
+        except OSError:
+            return 0
+
+    def is_active(self) -> bool:
+        """JSON is the fallback authority; the store selector decides."""
+        return True
+
+    def close(self) -> None:
+        return None
+
     def write_session(self, session: dict[str, Any]) -> dict[str, Any]:
         """Write a full session payload for tests and migration experiments."""
         if not isinstance(session, dict):

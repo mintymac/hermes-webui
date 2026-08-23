@@ -1248,6 +1248,21 @@ _sqlite_session_store_instance = None
 # the row reads healthy again.
 _SQLITE_UNREADABLE_SIDS: dict[str, object] = {}
 
+def get_session_store():
+    """Return the active session store backend (api.session_store.SessionStore).
+
+    SQLite when an active sessions.db cutover exists, otherwise the JSON
+    sidecar adapter. Callers that only need the canonical CRUD surface should
+    use this instead of branching on the backend.
+    """
+    store = _get_sqlite_session_store()
+    if store:
+        return store
+    from api.webui_session_db import WebUIJsonSessionDB
+
+    return WebUIJsonSessionDB(session_dir=SESSION_DIR)
+
+
 def _get_sqlite_session_store():
     global _sqlite_session_store_instance
     if _sqlite_session_store_instance is not None:

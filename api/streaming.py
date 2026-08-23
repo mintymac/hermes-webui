@@ -4745,20 +4745,38 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
     traversal, but it should not continue to appear as an active sidebar row.
     """
     old_path = SESSION_DIR / f'{old_sid}.json'
-    if not old_path.exists():
+    # Canonical store check: migrated sessions are SQLite-only (no sidecar),
+    # so a sidecar-only existence test would skip snapshot preservation and
+    # lose compression lineage for them.
+    from api.models import get_session_store
+
+    store = get_session_store()
+    if old_path.exists():
+        pass  # read below
+    elif store.session_exists(old_sid):
+        pass  # read below via the store
+    else:
         return
     try:
-        existing_text = old_path.read_text(encoding='utf-8')
-        try:
-            existing = json.loads(existing_text)
-            existing_msgs = len(existing.get('messages') or [])
-            existing_snapshot = bool(existing.get('pre_compression_snapshot'))
-        except (json.JSONDecodeError, ValueError):
-            # Treat corrupt/malformed old JSON as missing history and rewrite it
-            # from the in-memory pre-compression messages below. That is safer
-            # than leaving an unreadable recovery snapshot behind.
-            existing_msgs = -1
-            existing_snapshot = False
+        if old_path.exists():
+            try:
+                existing = json.loads(old_path.read_text(encoding='utf-8'))
+                existing_msgs = len(existing.get('messages') or [])
+                existing_snapshot = bool(existing.get('pre_compression_snapshot'))
+            except (json.JSONDecodeError, ValueError, OSError):
+                # Treat corrupt/malformed old JSON as missing history and rewrite it
+                # from the in-memory pre-compression messages below. That is safer
+                # than leaving an unreadable recovery snapshot behind.
+                existing_msgs = -1
+                existing_snapshot = False
+        else:
+            try:
+                meta = store.read_metadata_only(old_sid) or {}
+                existing_msgs = meta.get('message_count') or 0
+                existing_snapshot = bool(meta.get('pre_compression_snapshot'))
+            except Exception:
+                existing_msgs = -1
+                existing_snapshot = False
         if len(s.messages) > existing_msgs:
             # In-memory messages are newer than the file; save the full old
             # snapshot from the current session object while preserving its
