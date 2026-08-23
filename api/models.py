@@ -1604,26 +1604,36 @@ class Session:
             # loaded with; the store compares-and-bumps atomically.
             _heal = self.session_id in _SQLITE_UNREADABLE_SIDS
             if _heal:
-                # The row's header may still be readable even when the
-                # transcript is not. If no draft was written while marked
-                # (the in-memory draft still equals the mark-time sidecar
-                # value), the row's draft is the newer truth — carry it
-                # through the heal instead of regressing it with the stale
-                # sidecar draft the object was loaded with.
-                _at_mark = _SQLITE_UNREADABLE_SIDS.get(self.session_id)
+                # Force-heal only while the row is genuinely unreadable. If
+                # it recovered, this sidecar-loaded object is a stale reader
+                # whose transcript predates the row's — refusing via the
+                # generation CAS beats silently rolling the row back.
                 try:
-                    _row_meta = store.read_metadata_only(self.session_id)
+                    _row_probe = store.read_session(self.session_id)
                 except Exception:
-                    _row_meta = None
-                if _row_meta is not None:
-                    _row_draft = _row_meta.get("composer_draft")
-                    if (
-                        _row_draft is not None
-                        and getattr(self, "composer_draft", None) == _at_mark
-                        and _row_draft != _at_mark
-                    ):
-                        self.composer_draft = _row_draft
-                        payload["composer_draft"] = _row_draft
+                    _row_probe = None
+                if _row_probe is None:
+                    # The row's header may still be readable even when the
+                    # transcript is not. If no draft was written while
+                    # marked (the in-memory draft still equals the mark-time
+                    # sidecar value), the row's draft is the newer truth —
+                    # carry it through the heal instead of regressing it.
+                    _at_mark = _SQLITE_UNREADABLE_SIDS.get(self.session_id)
+                    try:
+                        _row_meta = store.read_metadata_only(self.session_id)
+                    except Exception:
+                        _row_meta = None
+                    if _row_meta is not None:
+                        _row_draft = _row_meta.get("composer_draft")
+                        if (
+                            _row_draft is not None
+                            and getattr(self, "composer_draft", None) == _at_mark
+                            and _row_draft != _at_mark
+                        ):
+                            self.composer_draft = _row_draft
+                            payload["composer_draft"] = _row_draft
+                else:
+                    _heal = False
             _write_result = store.write_session(
                 payload,
                 expected_generation=getattr(self, "_persisted_generation", None),
@@ -1813,13 +1823,33 @@ class Session:
         store = get_session_store()
         sqlite_read_failed = False
         if store.backend != "json" and sid in _SQLITE_UNREADABLE_SIDS:
-            # While marked, the sidecar is authoritative for reads AND
-            # writes: save_metadata() routes drafts there, so loads must
-            # read it too, or drafts saved during the outage would be
-            # invisible here. The mark clears when a full save() heals the
-            # row with the (sidecar-loaded) in-memory state, or below when
-            # the sidecar itself is gone and the row reads healthy again.
-            pass
+            # Marked: the sidecar was authoritative while the row was
+            # unreadable. Probe the row first — a FULL read success proves
+            # recovery (transcript included). Demote then, carrying any
+            # marked-window draft back; if the carry fails, keep the mark
+            # so routing stays consistent. A still-unreadable row falls
+            # through to the sidecar-authoritative path below.
+            try:
+                data = store.read_session(sid)
+            except Exception:
+                data = None
+            if data is not None:
+                _at_mark = _SQLITE_UNREADABLE_SIDS.get(sid)
+                _carried = True
+                try:
+                    _sc = SESSION_DIR / f'{sid}.json'
+                    if _sc.exists():
+                        _live = json.loads(_sc.read_text(encoding='utf-8')).get('composer_draft')
+                        if _live != _at_mark:
+                            store.update_metadata(sid, {"composer_draft": _live})
+                            data['composer_draft'] = _live
+                except Exception:
+                    _carried = False
+                    logger.debug("Failed to carry fallback draft for %s", sid, exc_info=True)
+                if _carried:
+                    _SQLITE_UNREADABLE_SIDS.pop(sid, None)
+                    data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
+                    return cls(**data)
         elif store.backend != "json":
             try:
                 data = store.read_session(sid)
@@ -1928,8 +1958,21 @@ class Session:
         # Marked sids read the sidecar instead (see _SQLITE_UNREADABLE_SIDS).
         try:
             store = get_session_store()
-            if store.backend != "json" and sid not in _SQLITE_UNREADABLE_SIDS:
-                data = store.read_metadata_only(sid)
+            if store.backend != "json":
+                if sid in _SQLITE_UNREADABLE_SIDS:
+                    # Marked: a metadata-only probe can succeed while the
+                    # transcript stays corrupt — only a full read proves
+                    # recovery and may demote the mark.
+                    data = None
+                    try:
+                        _full = store.read_session(sid)
+                    except Exception:
+                        _full = None
+                    if _full is not None:
+                        _SQLITE_UNREADABLE_SIDS.pop(sid, None)
+                        data = store.read_metadata_only(sid)
+                else:
+                    data = store.read_metadata_only(sid)
                 if data is not None:
                     data['messages'] = []
                     data['tool_calls'] = []
