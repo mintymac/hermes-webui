@@ -103,7 +103,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     chat_id TEXT,
     session_key TEXT,
     platform TEXT,
-    extra_json TEXT
+    extra_json TEXT,
+    generation INTEGER NOT NULL DEFAULT 0,
+    null_fields_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -173,6 +175,13 @@ class WebUIPostgresSessionDB:
                 stmt = stmt.strip()
                 if stmt:
                     conn.execute(stmt)
+            # v4 columns for databases created by earlier versions.
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS generation INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS null_fields_json TEXT"
+            )
             if conn.execute("SELECT 1 FROM meta WHERE key = 'created_by'").fetchone() is None:
                 has_rows = conn.execute("SELECT 1 FROM sessions LIMIT 1").fetchone() is not None
                 conn.execute(
@@ -286,7 +295,13 @@ class WebUIPostgresSessionDB:
 
     # -- writes ------------------------------------------------------------
 
-    def write_session(self, session: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+    def write_session(
+        self,
+        session: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
         if not isinstance(session, dict):
             raise TypeError("session must be a dict")
         sid = session.get("session_id")
@@ -305,14 +320,25 @@ class WebUIPostgresSessionDB:
         conn = self._conn()
         with conn:
             self._bump_revision(conn)
-            self._write_session_row(conn, sid, payload, force=force)
+            self._write_session_row(
+                conn, sid, payload,
+                expected_generation=expected_generation, force=force,
+            )
             self._write_json_table(conn, "messages", "message_json", sid, messages)
             self._write_json_table(conn, "tool_calls", "tool_call_json", sid, tool_calls)
             self._write_json_table(conn, "context_messages", "message_json", sid, context_messages)
             self._write_anchor_scenes(conn, sid, payload.get("anchor_activity_scenes", {}))
         return self.read_session(sid) or {}
 
-    def _write_session_row(self, conn, sid: str, payload: dict[str, Any], *, force: bool = False) -> None:
+    def _write_session_row(
+        self,
+        conn,
+        sid: str,
+        payload: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+        force: bool = False,
+    ) -> None:
         cols = ["session_id"]
         vals: list[Any] = [sid]
         for field in _SESSION_SCALAR_FIELDS:
@@ -340,24 +366,39 @@ class WebUIPostgresSessionDB:
         extra = {k: v for k, v in payload.items() if k not in consumed}
         cols.append("extra_json")
         vals.append(_json_dump(extra) if extra else None)
+        # Key-presence contract: explicitly-None keys read back as present None.
+        null_fields = sorted(k for k, v in payload.items() if v is None)
+        cols.append("null_fields_json")
+        vals.append(_json_dump(null_fields) if null_fields else None)
+
+        row = conn.execute(
+            "SELECT generation FROM sessions WHERE session_id = %s", (sid,)
+        ).fetchone()
+        current_generation = int(row[0] or 0) if row is not None else None
+        if current_generation is None:
+            new_generation = 1
+        elif force:
+            new_generation = current_generation + 1
+        elif expected_generation is None or int(expected_generation) != current_generation:
+            raise StaleSessionWriteError(
+                f"Refusing to overwrite session {sid!r}: expected generation "
+                f"{expected_generation!r} != persisted {current_generation!r} "
+                f"(stale writer or unloaded lineage; use force only for "
+                f"deliberate heals)"
+            )
+        else:
+            new_generation = current_generation + 1
+
+        cols.append("generation")
+        vals.append(new_generation)
 
         placeholders = ", ".join("%s" for _ in cols)
-        guard = (
-            ""
-            if force
-            else " WHERE COALESCE(excluded.updated_at, -1) >= COALESCE(sessions.updated_at, -1)"
-        )
-        cur = conn.execute(
+        conn.execute(
             f"INSERT INTO sessions ({', '.join(cols)}) VALUES ({placeholders}) "
             "ON CONFLICT(session_id) DO UPDATE SET "
-            + ", ".join(f"{c}=excluded.{c}" for c in cols)
-            + guard,
+            + ", ".join(f"{c}=excluded.{c}" for c in cols),
             vals,
         )
-        if cur.rowcount == 0:
-            raise StaleSessionWriteError(
-                f"Refusing to overwrite newer persisted session {sid!r} with older state"
-            )
 
     def _write_json_table(self, conn, table: str, column: str, sid: str, rows: list[Any]) -> None:
         conn.execute(f"DELETE FROM {table} WHERE session_id = %s", (sid,))
@@ -401,6 +442,26 @@ class WebUIPostgresSessionDB:
                     values.append(v)
                 else:
                     extras[k] = v
+            # Maintain null key-presence across targeted updates.
+            row = conn.execute(
+                "SELECT null_fields_json FROM sessions WHERE session_id = %s", (sid,)
+            ).fetchone()
+            null_fields: list[str] = []
+            if row is not None and row[0]:
+                try:
+                    parsed = json.loads(row[0])
+                    if isinstance(parsed, list):
+                        null_fields = [x for x in parsed if isinstance(x, str)]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            for k, v in fields.items():
+                if v is None:
+                    if k not in null_fields:
+                        null_fields.append(k)
+                elif k in null_fields:
+                    null_fields.remove(k)
+            set_parts.append("null_fields_json = %s")
+            values.append(_json_dump(null_fields) if null_fields else None)
             if extras:
                 row = conn.execute(
                     "SELECT extra_json FROM sessions WHERE session_id = %s", (sid,)
@@ -467,6 +528,18 @@ class WebUIPostgresSessionDB:
             if isinstance(extra, dict):
                 for k, v in extra.items():
                     row.setdefault(k, v)
+        null_fields_json = d.get("null_fields_json")
+        if null_fields_json:
+            try:
+                null_fields = json.loads(null_fields_json)
+            except (json.JSONDecodeError, TypeError):
+                null_fields = None
+            if isinstance(null_fields, list):
+                for k in null_fields:
+                    if isinstance(k, str):
+                        row[k] = None
+        if d.get("generation") is not None:
+            row["generation"] = d["generation"]
         return row
 
     def _row_to_session(self, d: dict[str, Any]) -> dict[str, Any]:

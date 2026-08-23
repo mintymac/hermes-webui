@@ -186,40 +186,104 @@ def test_persisted_session_ids_includes_sqlite(monkeypatch):
     assert "sid-4" in ids
 
 
-def test_stale_write_fence_refuses_older_updated_at():
-    """Gate finding: a regressive full write must not overwrite a newer row."""
+def test_generation_cas_refuses_stale_writers():
+    """Gate finding: the fence is a durable per-session generation CAS.
+
+    updated_at cannot fence real stale Session objects (save() stamps
+    time.time() before writing); only the generation the object was loaded
+    with can. Direct writes without lineage to an existing row are refused;
+    matching lineage bumps; stale lineage is refused; force heals.
+    """
     d = _tmp_session_dir()
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
 
-    newer = _sample_session_dict("sid-fence")
-    newer["updated_at"] = 2000.0
-    store.write_session(newer)
+    store.write_session(_sample_session_dict("sid-fence"))  # generation 1
 
-    stale = _sample_session_dict("sid-fence")
-    stale["updated_at"] = 1000.0
-    stale["title"] = "stale title"
+    # No lineage (expected_generation=None) onto an existing row: refused.
     try:
-        store.write_session(stale)
+        store.write_session(_sample_session_dict("sid-fence"))
     except sqlite_db.StaleSessionWriteError:
         pass
     else:
-        raise AssertionError("stale write must be refused")
+        raise AssertionError("lineage-less overwrite must be refused")
 
-    row = store.read_session("sid-fence")
-    assert row["title"] == "Test Session"
-    assert row["updated_at"] == 2000.0
+    # Matching lineage: compare-and-bump.
+    store.write_session(_sample_session_dict("sid-fence"), expected_generation=1)
+    assert store.read_session("sid-fence")["generation"] == 2
 
-    # Equal updated_at is allowed (idempotent rewrite); newer is allowed.
-    store.write_session(newer)
-    newest = _sample_session_dict("sid-fence")
-    newest["updated_at"] = 3000.0
-    store.write_session(newest)
-    assert store.read_session("sid-fence")["updated_at"] == 3000.0
+    # Stale lineage: refused.
+    try:
+        store.write_session(_sample_session_dict("sid-fence"), expected_generation=1)
+    except sqlite_db.StaleSessionWriteError:
+        pass
+    else:
+        raise AssertionError("stale generation must be refused")
 
-    # force bypasses for deliberate heals.
-    stale["updated_at"] = 500.0
-    store.write_session(stale, force=True)
-    assert store.read_session("sid-fence")["updated_at"] == 500.0
+    # force bypasses for deliberate heals and bumps anyway.
+    store.write_session(_sample_session_dict("sid-fence"), force=True)
+    assert store.read_session("sid-fence")["generation"] == 3
+
+
+def test_two_readers_stale_writer_is_rejected(monkeypatch):
+    """Gate finding: load A and B, save A, then stale B must be rejected."""
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-2readers"))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    a = models.Session.load("sid-2readers")
+    b = models.Session.load("sid-2readers")
+    assert a is not None and b is not None
+    assert a._persisted_generation == 1
+    assert b._persisted_generation == 1
+
+    a.title = "saved by A"
+    a.save()
+    assert a._persisted_generation == 2
+    assert store.read_session("sid-2readers")["title"] == "saved by A"
+
+    b.title = "stale B write"
+    try:
+        b.save()
+    except sqlite_db.StaleSessionWriteError:
+        pass
+    else:
+        raise AssertionError("stale reader B must be rejected")
+
+    assert store.read_session("sid-2readers")["title"] == "saved by A"
+
+    # A remains writeable after its successful save (generation updated).
+    a.title = "saved again by A"
+    a.save()
+    assert store.read_session("sid-2readers")["title"] == "saved again by A"
+
+
+def test_null_valued_keys_round_trip_with_presence(monkeypatch):
+    """Key-presence contract: an explicitly-None field reads back as a
+    present None, matching the JSON backend's native behavior."""
+    d = _tmp_session_dir()
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+
+    payload = _sample_session_dict("sid-nulls")
+    payload["personality"] = None
+    payload["project_id"] = None
+    payload["user_id"] = None
+    store.write_session(payload)
+
+    loaded = store.read_session("sid-nulls")
+    assert "personality" in loaded and loaded["personality"] is None
+    assert "project_id" in loaded and loaded["project_id"] is None
+    assert "user_id" in loaded and loaded["user_id"] is None
+
+    # update_metadata maintains presence in both directions.
+    store.update_metadata("sid-nulls", {"personality": "now-set", "threshold_tokens": None})
+    reloaded = store.read_session("sid-nulls")
+    assert reloaded["personality"] == "now-set"
+    assert "threshold_tokens" in reloaded and reloaded["threshold_tokens"] is None
 
 
 def test_save_heal_bypasses_fence_for_marked_session(monkeypatch):

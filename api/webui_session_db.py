@@ -190,8 +190,19 @@ class WebUIJsonSessionDB:
     def close(self) -> None:
         return None
 
-    def write_session(self, session: dict[str, Any]) -> dict[str, Any]:
-        """Write a full session payload for tests and migration experiments."""
+    def write_session(
+        self,
+        session: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Write a full session payload for tests and migration experiments.
+
+        ``expected_generation``/``force`` exist for SessionStore signature
+        parity; sidecar writes are atomic-replace with no generation CAS, so
+        they are accepted and unused here.
+        """
         if not isinstance(session, dict):
             raise TypeError("session must be a dict")
         sid = session.get("session_id")

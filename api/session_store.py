@@ -39,8 +39,21 @@ class SessionStore(Protocol):
         """Metadata fields only — no transcript tables. None if absent."""
         ...
 
-    def write_session(self, session: dict[str, Any]) -> dict[str, Any]:
-        """Persist a full session dict; returns the persisted representation."""
+    def write_session(
+        self,
+        session: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Persist a full session dict; returns the persisted representation.
+
+        SQL backends enforce a durable per-session generation CAS:
+        ``expected_generation`` must match the persisted row's generation (or
+        the row must not exist yet); ``force=True`` is reserved for deliberate
+        heals/imports. The returned dict carries the new ``generation``.
+        JSON backends accept both kwargs for parity and ignore them.
+        """
         ...
 
     def update_metadata(self, sid: str, fields: dict[str, Any]) -> dict[str, Any]:

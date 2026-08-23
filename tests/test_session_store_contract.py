@@ -168,18 +168,32 @@ def test_metadata_only_read_has_count_without_transcript(sql_store):
     assert "messages" not in meta
 
 
-def test_stale_write_fence(sql_store):
-    newer = _sample("c9")
-    newer["updated_at"] = 2000.0
-    sql_store.write_session(newer)
-    stale = _sample("c9")
-    stale["updated_at"] = 1000.0
-    stale["title"] = "stale"
+def test_generation_cas(sql_store):
+    """Durable per-session generation CAS on every SQL backend."""
+    sql_store.write_session(_sample("c9"))  # generation 1
     with pytest.raises(StaleSessionWriteError):
-        sql_store.write_session(stale)
-    assert sql_store.read_session("c9")["title"] == "Contract Session"
-    sql_store.write_session(stale, force=True)  # heal bypass
-    assert sql_store.read_session("c9")["title"] == "stale"
+        sql_store.write_session(_sample("c9"))  # no lineage
+    sql_store.write_session(_sample("c9"), expected_generation=1)  # bump -> 2
+    assert sql_store.read_session("c9")["generation"] == 2
+    with pytest.raises(StaleSessionWriteError):
+        sql_store.write_session(_sample("c9"), expected_generation=1)  # stale
+    sql_store.write_session(_sample("c9"), force=True)  # deliberate heal
+    assert sql_store.read_session("c9")["generation"] == 3
+
+
+def test_null_key_presence(sql_store):
+    """Explicitly-None fields read back as present None (JSON parity)."""
+    payload = _sample("c10")
+    payload["personality"] = None
+    payload["project_id"] = None
+    sql_store.write_session(payload)
+    loaded = sql_store.read_session("c10")
+    assert "personality" in loaded and loaded["personality"] is None
+    assert "project_id" in loaded and loaded["project_id"] is None
+    sql_store.update_metadata("c10", {"personality": "set", "threshold_tokens": None})
+    reloaded = sql_store.read_session("c10")
+    assert reloaded["personality"] == "set"
+    assert "threshold_tokens" in reloaded and reloaded["threshold_tokens"] is None
 
 
 def test_cutover_marker_blocks_incomplete_migration(sql_store):

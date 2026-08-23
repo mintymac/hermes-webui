@@ -4782,9 +4782,19 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
             # snapshot from the current session object while preserving its
             # pre-existing parent_session_id lineage.
             saved_sid = s.session_id
+            saved_generation = getattr(s, '_persisted_generation', None)
             saved_snapshot = bool(getattr(s, 'pre_compression_snapshot', False))
             saved_pinned = bool(getattr(s, 'pinned', False))
             s.session_id = old_sid
+            # The CAS lineage must follow the row being written (old_sid),
+            # not the continuation row this object was loaded from.
+            try:
+                _old_meta = store.read_metadata_only(old_sid) if store else None
+                s._persisted_generation = (
+                    _old_meta.get('generation') if _old_meta else None
+                )
+            except Exception:
+                s._persisted_generation = None
             s.pre_compression_snapshot = True
             s.pinned = False
             # Stage-359 / PR #2295: clear runtime stream-state fields on the
@@ -4814,6 +4824,7 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
                 )
             finally:
                 s.session_id = saved_sid
+                s._persisted_generation = saved_generation
                 s.pre_compression_snapshot = saved_snapshot
                 s.pinned = saved_pinned
                 s.active_stream_id = saved_active_stream_id

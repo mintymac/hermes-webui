@@ -1455,7 +1455,13 @@ class Session:
             'model_explicit_pick_signature', 'is_cli_session', 'source_tag',
             'raw_source', 'session_source', 'source_label', 'read_only',
             'anchor_scene_index', 'message_count', 'extra_session_fields',
+            'generation',
         }
+        # Durable CAS generation: the generation the persisted row had when
+        # this object was loaded. save() passes it to write_session, which
+        # compares-and-bumps atomically; a stale object loaded before a newer
+        # writer is refused instead of silently rolling the session back.
+        self._persisted_generation = kwargs.get('generation')
         _bag = kwargs.get('extra_session_fields')
         self.extra_session_fields = dict(_bag) if isinstance(_bag, dict) else {}
         for _k, _v in kwargs.items():
@@ -1563,11 +1569,17 @@ class Session:
             payload.setdefault("tool_calls", [])
             payload.setdefault("context_messages", [])
             payload.setdefault("anchor_activity_scenes", {})
-            # force only for a deliberate heal of a row marked unreadable:
-            # its persisted updated_at may be newer than the sidecar's, and
-            # the stale-writer fence would otherwise refuse the rewrite.
-            store.write_session(payload, force=self.session_id in _SQLITE_UNREADABLE_SIDS)
+            # force only for a deliberate heal of a row marked unreadable.
+            # expected_generation carries the CAS lineage the object was
+            # loaded with; the store compares-and-bumps atomically.
+            _write_result = store.write_session(
+                payload,
+                expected_generation=getattr(self, "_persisted_generation", None),
+                force=self.session_id in _SQLITE_UNREADABLE_SIDS,
+            )
             _SQLITE_UNREADABLE_SIDS.pop(self.session_id, None)
+            if isinstance(_write_result, dict) and _write_result.get("generation") is not None:
+                self._persisted_generation = _write_result["generation"]
             if not skip_index:
                 _write_session_index(updates=[self])
             return
@@ -1604,6 +1616,12 @@ class Session:
             'share_token', 'share_created_at',
         ]
         meta = {k: getattr(self, k, None) for k in METADATA_FIELDS}
+        # Forward-compatible retention: restore unknown top-level keys from
+        # the kwargs bag so JSON round trips stay lossless too. Never nest
+        # the bag itself.
+        for _k, _v in (getattr(self, "extra_session_fields", {}) or {}).items():
+            if _k != "extra_session_fields":
+                meta.setdefault(_k, _v)
         # #5854: message_count and a compact anchor-scene fingerprint go in the
         # metadata prefix (BEFORE messages) so load_metadata_only() and the
         # sidebar-poll freshness check never have to parse the full (250-480KB)

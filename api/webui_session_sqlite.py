@@ -223,7 +223,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     chat_id TEXT,
     session_key TEXT,
     platform TEXT,
-    extra_json TEXT
+    extra_json TEXT,
+    generation INTEGER NOT NULL DEFAULT 0,
+    null_fields_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -266,7 +268,7 @@ CREATE INDEX IF NOT EXISTS idx_context_messages_session ON context_messages(sess
 """
 
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 _META_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -285,6 +287,8 @@ _SESSIONS_V2_COLUMNS: dict[str, str] = {
     "session_key": "session_key TEXT",
     "platform": "platform TEXT",
     "extra_json": "extra_json TEXT",
+    "generation": "generation INTEGER NOT NULL DEFAULT 0",
+    "null_fields_json": "null_fields_json TEXT",
 }
 
 
@@ -478,7 +482,13 @@ class WebUISqliteSessionDB:
     # Write paths
     # ------------------------------------------------------------------
 
-    def write_session(self, session: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+    def write_session(
+        self,
+        session: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
         if not isinstance(session, dict):
             raise TypeError("session must be a dict")
         sid = session.get("session_id")
@@ -498,7 +508,10 @@ class WebUISqliteSessionDB:
         conn = self._conn()
         with conn:
             self._bump_revision(conn)
-            self._write_session_row(conn, sid, payload, force=force)
+            self._write_session_row(
+                conn, sid, payload,
+                expected_generation=expected_generation, force=force,
+            )
             self._write_messages(conn, sid, messages)
             self._write_tool_calls(conn, sid, tool_calls)
             self._write_context_messages(conn, sid, context_messages)
@@ -543,6 +556,26 @@ class WebUISqliteSessionDB:
                 current.update(extras)
                 set_parts.append("extra_json = ?")
                 values.append(_json_dump(current))
+            # Maintain null key-presence across targeted updates.
+            nrow = conn.execute(
+                "SELECT null_fields_json FROM sessions WHERE session_id = ?", (sid,)
+            ).fetchone()
+            null_fields: list[str] = []
+            if nrow is not None and nrow["null_fields_json"]:
+                try:
+                    parsed = json.loads(nrow["null_fields_json"])
+                    if isinstance(parsed, list):
+                        null_fields = [x for x in parsed if isinstance(x, str)]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            for k, v in fields.items():
+                if v is None:
+                    if k not in null_fields:
+                        null_fields.append(k)
+                elif k in null_fields:
+                    null_fields.remove(k)
+            set_parts.append("null_fields_json = ?")
+            values.append(_json_dump(null_fields) if null_fields else None)
             # Only bump updated_at when the caller explicitly provides it.
             # Draft autosave calls save_metadata() without updated_at so that
             # typing does not reorder the session in the sidebar or trigger
@@ -584,7 +617,15 @@ class WebUISqliteSessionDB:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _write_session_row(self, conn: sqlite3.Connection, sid: str, payload: dict[str, Any], *, force: bool = False) -> None:
+    def _write_session_row(
+        self,
+        conn: sqlite3.Connection,
+        sid: str,
+        payload: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+        force: bool = False,
+    ) -> None:
         cols = ["session_id"]
         vals: list[Any] = [sid]
         for field in _SESSION_SCALAR_FIELDS:
@@ -618,29 +659,48 @@ class WebUISqliteSessionDB:
         extra = {k: v for k, v in payload.items() if k not in consumed}
         cols.append("extra_json")
         vals.append(_json_dump(extra) if extra else None)
+        # Key-presence contract: an explicitly-None top-level key must read
+        # back as a present None (the JSON backend preserves this natively).
+        null_fields = sorted(k for k, v in payload.items() if v is None)
+        cols.append("null_fields_json")
+        vals.append(_json_dump(null_fields) if null_fields else None)
+
+        # Stale-writer fence: a durable per-session generation compared and
+        # bumped atomically. updated_at cannot fence real stale Session
+        # objects — save() stamps time.time() before writing — so writers
+        # must carry the generation their object was loaded with.
+        #   - row absent: insert generation 1.
+        #   - force: deliberate heal/import — bump and overwrite.
+        #   - expected_generation == row generation: bump and overwrite.
+        #   - anything else (stale or lineage-unknown): refuse loudly.
+        row = conn.execute(
+            "SELECT generation FROM sessions WHERE session_id = ?", (sid,)
+        ).fetchone()
+        current_generation = int(row["generation"] or 0) if row is not None else None
+        if current_generation is None:
+            new_generation = 1
+        elif force:
+            new_generation = current_generation + 1
+        elif expected_generation is None or int(expected_generation) != current_generation:
+            raise StaleSessionWriteError(
+                f"Refusing to overwrite session {sid!r}: expected generation "
+                f"{expected_generation!r} != persisted {current_generation!r} "
+                f"(stale writer or unloaded lineage; use force only for "
+                f"deliberate heals)"
+            )
+        else:
+            new_generation = current_generation + 1
+
+        cols.append("generation")
+        vals.append(new_generation)
 
         placeholders = ", ".join("?" for _ in cols)
-        # Stale-writer fence: a full write may only replace a row whose
-        # persisted updated_at is not newer. A stale recovered sidecar (or
-        # any regressive writer) is refused loudly instead of silently
-        # rolling the session back. force=True is reserved for deliberate
-        # heals (e.g. rewriting a row marked unreadable from its sidecar).
-        guard = (
-            ""
-            if force
-            else " WHERE COALESCE(excluded.updated_at, -1) >= COALESCE(sessions.updated_at, -1)"
-        )
-        cur = conn.execute(
+        conn.execute(
             f"INSERT INTO sessions ({', '.join(cols)}) VALUES ({placeholders}) "
             "ON CONFLICT(session_id) DO UPDATE SET "
-            + ", ".join(f"{c}=excluded.{c}" for c in cols)
-            + guard,
+            + ", ".join(f"{c}=excluded.{c}" for c in cols),
             vals,
         )
-        if cur.rowcount == 0:
-            raise StaleSessionWriteError(
-                f"Refusing to overwrite newer persisted session {sid!r} with older state"
-            )
 
     def _write_messages(self, conn: sqlite3.Connection, sid: str, messages: list[Any]) -> None:
         conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
@@ -709,6 +769,18 @@ class WebUISqliteSessionDB:
             if isinstance(extra, dict):
                 for k, v in extra.items():
                     row.setdefault(k, v)
+        null_fields_json = d.get("null_fields_json")
+        if null_fields_json:
+            try:
+                null_fields = json.loads(null_fields_json)
+            except (json.JSONDecodeError, TypeError):
+                null_fields = None
+            if isinstance(null_fields, list):
+                for k in null_fields:
+                    if isinstance(k, str):
+                        row[k] = None
+        if d.get("generation") is not None:
+            row["generation"] = d["generation"]
         return row
 
     def _metadata_row(self, sid: str) -> dict[str, Any]:
