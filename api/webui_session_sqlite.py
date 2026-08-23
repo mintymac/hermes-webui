@@ -85,6 +85,13 @@ _SESSION_SCALAR_FIELDS: tuple[str, ...] = (
     "message_count",
     "share_token",
     "share_created_at",
+    "created_workspace",
+    "intentional_shrink_generation",
+    # Runtime identity fields (messaging/gateway-originated sessions).
+    "user_id",
+    "chat_id",
+    "session_key",
+    "platform",
     # JSON blob fields
     "compression_anchor_message_key",
     "compression_anchor_details",
@@ -208,7 +215,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     message_count INTEGER DEFAULT 0,
     anchor_scene_index TEXT,
     anchor_scene_index_hash TEXT,
-    anchor_activity_scenes_json TEXT
+    anchor_activity_scenes_json TEXT,
+    created_workspace TEXT,
+    intentional_shrink_generation TEXT,
+    user_id TEXT,
+    chat_id TEXT,
+    session_key TEXT,
+    platform TEXT,
+    extra_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -251,6 +265,21 @@ CREATE INDEX IF NOT EXISTS idx_context_messages_session ON context_messages(sess
 """
 
 
+_SCHEMA_VERSION = 2
+
+# Columns added in schema v2 (name -> ALTER TABLE DDL). CREATE TABLE carries
+# them for fresh databases; these run for pre-v2 databases.
+_SESSIONS_V2_COLUMNS: dict[str, str] = {
+    "created_workspace": "created_workspace TEXT",
+    "intentional_shrink_generation": "intentional_shrink_generation TEXT",
+    "user_id": "user_id TEXT",
+    "chat_id": "chat_id TEXT",
+    "session_key": "session_key TEXT",
+    "platform": "platform TEXT",
+    "extra_json": "extra_json TEXT",
+}
+
+
 class WebUISqliteSessionDB:
     """SQLite-backed WebUI session store.
 
@@ -289,8 +318,17 @@ class WebUISqliteSessionDB:
         return conn
 
     def _ensure_schema(self) -> None:
-        self._conn().executescript(SCHEMA_SQL)
-        self._conn().commit()
+        conn = self._conn()
+        conn.executescript(SCHEMA_SQL)
+        # v2 migration: dbs created before the lossless schema lack the
+        # trailing columns. Add them idempotently (fresh dbs already have
+        # them via CREATE TABLE above) and stamp the schema version.
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        for col, ddl in _SESSIONS_V2_COLUMNS.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {ddl}")
+        conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        conn.commit()
 
     def close(self) -> None:
         conn = getattr(self._local, "conn", None)
@@ -409,13 +447,32 @@ class WebUISqliteSessionDB:
         with conn:
             set_parts: list[str] = []
             values: list[Any] = []
+            extras: dict[str, Any] = {}
             for k, v in fields.items():
                 if k in _SESSION_JSON_FIELDS:
                     set_parts.append(f"{k} = ?")
                     values.append(None if v is None else _json_dump(v))
-                else:
+                elif k in _SESSION_SCALAR_FIELDS:
                     set_parts.append(f"{k} = ?")
                     values.append(v)
+                else:
+                    # Unknown/forward-compatible keys ride in extra_json.
+                    extras[k] = v
+            if extras:
+                row = conn.execute(
+                    "SELECT extra_json FROM sessions WHERE session_id = ?", (sid,)
+                ).fetchone()
+                current: dict[str, Any] = {}
+                if row is not None and row["extra_json"]:
+                    try:
+                        parsed = json.loads(row["extra_json"])
+                        if isinstance(parsed, dict):
+                            current = parsed
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                current.update(extras)
+                set_parts.append("extra_json = ?")
+                values.append(_json_dump(current))
             # Only bump updated_at when the caller explicitly provides it.
             # Draft autosave calls save_metadata() without updated_at so that
             # typing does not reorder the session in the sidebar or trigger
@@ -480,6 +537,16 @@ class WebUISqliteSessionDB:
         cols.append("anchor_activity_scenes_json")
         scenes = payload.get("anchor_activity_scenes")
         vals.append(_json_dump(scenes) if scenes is not None else None)
+        # Forward-compatible preservation: top-level session keys without a
+        # dedicated column ride in extra_json so round-trips stay lossless
+        # for fields added after this schema version.
+        consumed = set(_SESSION_SCALAR_FIELDS) | {
+            "session_id",
+            "anchor_activity_scenes",
+        }
+        extra = {k: v for k, v in payload.items() if k not in consumed}
+        cols.append("extra_json")
+        vals.append(_json_dump(extra) if extra else None)
 
         placeholders = ", ".join("?" for _ in cols)
         conn.execute(
@@ -547,6 +614,15 @@ class WebUISqliteSessionDB:
             row[field] = v
         if include_computed:
             row["last_message_at"] = d.get("updated_at") or d.get("created_at")
+        extra_json = d.get("extra_json")
+        if extra_json:
+            try:
+                extra = json.loads(extra_json)
+            except (json.JSONDecodeError, TypeError):
+                extra = None
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    row.setdefault(k, v)
         return row
 
     def _metadata_row(self, sid: str) -> dict[str, Any]:

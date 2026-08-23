@@ -1421,6 +1421,21 @@ class Session:
         # (often 250-480KB) scene bodies, which serialize AFTER messages. None
         # on legacy sidecars (scenes-before-messages, no fingerprint) — callers
         # fall back to reading keys/updated_at off anchor_activity_scenes.
+        # Forward-compatible retention: top-level session keys we do not
+        # explicitly model (e.g. user_id/chat_id/session_key/platform on
+        # messaging-originated sessions, or fields added by newer versions)
+        # survive load -> save round trips through this bag; save() splats
+        # it back into the persisted payload.
+        _consumed_kwargs = {
+            'model_explicit_pick_signature', 'is_cli_session', 'source_tag',
+            'raw_source', 'session_source', 'source_label', 'read_only',
+            'anchor_scene_index', 'message_count', 'extra_session_fields',
+        }
+        _bag = kwargs.get('extra_session_fields')
+        self.extra_session_fields = dict(_bag) if isinstance(_bag, dict) else {}
+        for _k, _v in kwargs.items():
+            if _k not in _consumed_kwargs:
+                self.extra_session_fields[_k] = _v
         _raw_scene_index = kwargs.get('anchor_scene_index')
         self._anchor_scene_index = _raw_scene_index if isinstance(_raw_scene_index, dict) else None
         raw_message_count = kwargs.get('message_count')
@@ -1515,6 +1530,10 @@ class Session:
             if touch_updated_at:
                 self.updated_at = time.time()
             payload = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+            _extra_bag = payload.pop("extra_session_fields", None)
+            if isinstance(_extra_bag, dict):
+                for _k, _v in _extra_bag.items():
+                    payload.setdefault(_k, _v)
             payload.setdefault("messages", [])
             payload.setdefault("tool_calls", [])
             payload.setdefault("context_messages", [])

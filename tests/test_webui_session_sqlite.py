@@ -57,6 +57,105 @@ def test_sqlite_store_update_metadata():
     assert len(loaded["messages"]) == 2
 
 
+def test_sqlite_round_trip_preserves_all_session_fields():
+    """Gate finding: SQLite round-trips must be lossless."""
+    d = _tmp_session_dir()
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-full")
+    payload.update(
+        {
+            "created_workspace": "/ws/created",
+            "intentional_shrink_generation": "gen-7",
+            "user_id": "user-1",
+            "chat_id": "chat-9",
+            "session_key": "key-abc",
+            "platform": "discord",
+            "enabled_toolsets": ["fs", "shell"],
+            "process_wakeup_pause": {"paused": True},
+        }
+    )
+    store.write_session(payload)
+    loaded = store.read_session("sid-full")
+    for k, v in payload.items():
+        assert loaded.get(k) == v, f"field {k!r} did not round-trip: {loaded.get(k)!r} != {v!r}"
+
+
+def test_sqlite_round_trip_preserves_unknown_top_level_keys():
+    """extra_json: fields this schema version does not know survive."""
+    d = _tmp_session_dir()
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-unknown")
+    payload["future_feature_flag"] = {"enabled": True, "tier": 3}
+    payload["brand_new_scalar"] = "hello-future"
+    store.write_session(payload)
+    loaded = store.read_session("sid-unknown")
+    assert loaded["future_feature_flag"] == {"enabled": True, "tier": 3}
+    assert loaded["brand_new_scalar"] == "hello-future"
+    # And via update_metadata merge.
+    store.update_metadata("sid-unknown", {"another_future_key": [1, 2]})
+    assert store.read_session("sid-unknown")["another_future_key"] == [1, 2]
+    assert store.read_session("sid-unknown")["brand_new_scalar"] == "hello-future"
+
+
+def test_session_level_unknown_keys_round_trip(monkeypatch):
+    """Session(**data) with unknown keys -> save() -> store keeps them."""
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-bag"))
+
+    data = store.read_session("sid-bag")
+    data["custom_messaging_field"] = {"channel": "tg", "thread": 42}
+    s = models.Session(**data)
+    s.save()
+
+    loaded = store.read_session("sid-bag")
+    assert loaded["custom_messaging_field"] == {"channel": "tg", "thread": 42}
+
+
+def test_schema_v2_migration_adds_columns_to_legacy_db():
+    """A db created by the pre-v2 schema gains the new columns on open."""
+    import re as _re
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    db_path = d / "sessions.db"
+    # Simulate a v1 database: the current schema minus the v2 columns.
+    v2_cols = set(sqlite_db._SESSIONS_V2_COLUMNS)
+    v1_lines = []
+    for line in sqlite_db.SCHEMA_SQL.splitlines():
+        stripped = line.strip()
+        if stripped and stripped.split()[0].rstrip(",") in v2_cols:
+            continue
+        v1_lines.append(line)
+    v1_schema = _re.sub(r",(\s*\);)", r"\1", "\n".join(v1_lines))
+    conn = _sq.connect(str(db_path))
+    conn.executescript(v1_schema)
+    conn.execute(
+        "INSERT INTO sessions (session_id, title, updated_at) VALUES ('s1', 'legacy', 1.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    loaded = store.read_session("s1")
+    assert loaded is not None
+    assert loaded["title"] == "legacy"
+
+    store.update_metadata("s1", {"user_id": "u1", "new_stuff": {"x": 1}})
+    reloaded = store.read_session("s1")
+    assert reloaded["user_id"] == "u1"
+    assert reloaded["new_stuff"] == {"x": 1}
+
+    conn = _sq.connect(str(db_path))
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    conn.close()
+    assert version == 2
+
+
 def test_session_load_uses_sqlite_when_db_exists(monkeypatch):
     d = _tmp_session_dir()
     # Patch global session dir for this test.
@@ -744,6 +843,44 @@ def test_delete_route_removes_sqlite_rows_and_index_does_not_resurrect(monkeypat
     models._write_session_index(updates=None, session_dir=d, session_index_file=index_file)
     entries = json.loads(index_file.read_text())
     assert all(e.get("session_id") != "sid-del" for e in entries)
+
+
+def test_delete_route_fails_closed_when_sqlite_delete_fails(monkeypatch):
+    """Gate finding: deletion must fail closed at the store boundary.
+
+    When the SQLite delete raises, the route must NOT unlink the sidecar,
+    prune the index, or report success — the transcript stays visible and
+    the delete stays retryable.
+    """
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+
+    sid = "sid-failclosed"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+    monkeypatch.setattr(models, "delete_cli_session", lambda sid_: True)
+
+    real_delete = store.delete_session
+
+    def _boom(sid_):
+        raise _sq.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "delete_session", _boom)
+
+    captured = _drive_delete_post(monkeypatch, {"session_id": sid})
+    assert captured.get("status") == 500
+    assert "error" in captured
+    # Nothing was torn down: the row survives and the session stays listed.
+    assert store.session_exists(sid) is True
+
+    # Recovery: the delete succeeds once the store works again.
+    monkeypatch.setattr(store, "delete_session", real_delete)
+    captured = _drive_delete_post(monkeypatch, {"session_id": sid})
+    assert captured.get("payload", {}).get("ok") is True
+    assert store.session_exists(sid) is False
 
 
 def test_delete_route_handles_unmigrated_json_session_with_store_active(monkeypatch):
