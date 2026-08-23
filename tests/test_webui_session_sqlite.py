@@ -1226,6 +1226,48 @@ def test_clear_route_verifies_persisted_state_via_store(monkeypatch):
     assert persisted.get("pending_user_message") is None
 
 
+def test_metadata_only_demote_carries_marked_draft(monkeypatch):
+    """Greptile P1: the metadata-only recovery path must carry sidecar-saved
+    drafts too, or demoting strands them."""
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_SQLITE_UNREADABLE_SIDS", {})
+
+    sid = "sid-meta-carry"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))
+    (d / f"{sid}.json").write_text(
+        json.dumps(_sample_session_dict(sid)), encoding="utf-8"
+    )
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    s = models.Session.load(sid)  # transient fail -> sidecar fallback, marked
+    assert s is not None
+    assert sid in models._SQLITE_UNREADABLE_SIDS
+
+    s.save_metadata({"composer_draft": {"text": "meta-carried", "files": []}})
+
+    # Row recovered: the metadata-only read demotes and carries the draft.
+    meta = models.Session.load_metadata_only(sid)
+    assert meta is not None
+    assert sid not in models._SQLITE_UNREADABLE_SIDS
+    assert store.read_metadata_only(sid)["composer_draft"]["text"] == "meta-carried"
+
+
 def test_ephemeral_cancel_cleanup_deletes_store_row(monkeypatch):
     """DB-only ephemeral cancel cleanup must delete the row (gate finding)."""
     import api.streaming as streaming

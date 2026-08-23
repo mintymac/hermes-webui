@@ -1962,15 +1962,29 @@ class Session:
                 if sid in _SQLITE_UNREADABLE_SIDS:
                     # Marked: a metadata-only probe can succeed while the
                     # transcript stays corrupt — only a full read proves
-                    # recovery and may demote the mark.
+                    # recovery and may demote the mark. Demote must also
+                    # carry any marked-window draft back into the row, or
+                    # this read would strand drafts saved to the sidecar.
                     data = None
                     try:
                         _full = store.read_session(sid)
                     except Exception:
                         _full = None
                     if _full is not None:
-                        _SQLITE_UNREADABLE_SIDS.pop(sid, None)
-                        data = store.read_metadata_only(sid)
+                        _at_mark = _SQLITE_UNREADABLE_SIDS.get(sid)
+                        _carried = True
+                        try:
+                            _sc = SESSION_DIR / f'{sid}.json'
+                            if _sc.exists():
+                                _live = json.loads(_sc.read_text(encoding='utf-8')).get('composer_draft')
+                                if _live != _at_mark:
+                                    store.update_metadata(sid, {"composer_draft": _live})
+                        except Exception:
+                            _carried = False
+                            logger.debug("Failed to carry fallback draft for %s", sid, exc_info=True)
+                        if _carried:
+                            _SQLITE_UNREADABLE_SIDS.pop(sid, None)
+                            data = store.read_metadata_only(sid)
                 else:
                     data = store.read_metadata_only(sid)
                 if data is not None:
