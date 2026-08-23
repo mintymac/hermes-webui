@@ -1963,10 +1963,15 @@ class Session:
                     # Marked: only a full read (transcript included) proves
                     # recovery — a metadata-only probe can succeed while the
                     # transcript stays corrupt. Demote carries marked-window
-                    # drafts back into the row via the shared helper.
+                    # drafts back into the row via the shared helper; use its
+                    # returned row data directly (no second read that could
+                    # race the mark-clearing with a row that vanishes).
                     data = None
-                    if _demote_marked_if_recovered(store, sid) is not None:
-                        data = store.read_metadata_only(sid)
+                    _demoted = _demote_marked_if_recovered(store, sid)
+                    if _demoted is not None:
+                        _demoted['messages'] = []
+                        _demoted['tool_calls'] = []
+                        data = _demoted
                 else:
                     data = store.read_metadata_only(sid)
                 if data is not None:
