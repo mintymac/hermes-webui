@@ -84,6 +84,8 @@ class WebUIJsonSessionDB:
     """Small SessionDB-like facade over existing WebUI session JSON files."""
 
     backend = "json"
+    supports_generation = False
+    supports_revision_counter = False
 
     def __init__(self, session_dir: Path | str | None = None):
         self._session_dir = Path(session_dir).expanduser().resolve() if session_dir else None

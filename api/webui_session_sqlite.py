@@ -300,6 +300,8 @@ class WebUISqliteSessionDB:
     """
 
     backend = "sqlite"
+    supports_generation = True
+    supports_revision_counter = True
 
     def __init__(
         self,
@@ -312,6 +314,9 @@ class WebUISqliteSessionDB:
         self._db_name = db_name
         self._created_by = created_by
         self._local = threading.local()
+        # Per-store failure state: sids whose row failed to read and whose
+        # sidecar became authoritative (sid -> sidecar draft at mark time).
+        self.unreadable_sids: dict[str, object] = {}
         self._ensure_schema()
 
     @property

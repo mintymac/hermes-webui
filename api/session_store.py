@@ -6,6 +6,23 @@ contract. ``api.models.get_session_store()`` returns the active backend;
 callers route session persistence through it instead of branching on the
 backend themselves.
 
+Capabilities
+------------
+Backends declare capabilities instead of classes: production code branches
+on ``supports_generation`` (durable per-session generation CAS + cutover
+markers + unreadable-row recovery state) and ``supports_revision_counter``
+(meta-table revision for cache invalidation). The JSON sidecar backend has
+neither: its writes are atomic-replace (last writer wins by file semantics)
+and its freshness signal is the directory mtime. The ``backend`` tag is
+informational (logging/tests) only — never a dispatch condition.
+
+Deliberate boundary: ``Session.save()`` keeps its legacy inline JSON writer
+for the sidecar backend (field-ordered metadata prefix, legacy-facts
+caching, self-heal hooks). The JSON adapter's ``write_session`` is the
+canonical CRUD surface used by routing/tests; they are not two competing
+writers — the adapter writes whole sidecars, the legacy path writes
+field-ordered ones for metadata-only readers.
+
 Backend notes
 -------------
 - JSON sidecars: one ``<sid>.json`` per session. ``get_revision()`` is the

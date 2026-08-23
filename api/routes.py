@@ -15939,26 +15939,23 @@ def handle_post(handler, parsed) -> bool:
                 p.relative_to(SESSION_DIR.resolve())
             except Exception:
                 return bad(handler, "Invalid session_id", 400)
-            # Fail-closed at the store boundary: when SQLite holds this
-            # session, the authoritative row must be deleted FIRST. Reporting
-            # success after a failed SQLite delete would leave the transcript
-            # on disk and let a later index rebuild resurrect the session —
-            # so any store error aborts the delete with a 500 before any
-            # sidecar/index/tombstone state is touched.
-            from api.models import _get_sqlite_session_store
+            # Fail-closed at the store boundary: when the active store holds
+            # this session, the authoritative record must be deleted FIRST.
+            # Reporting success after a failed delete would leave the
+            # transcript in place while the index/sidecar/tombstone state
+            # claims it is gone — so any store error aborts the delete with
+            # a 500 before any of that state is touched.
+            from api.models import delete_session_record
 
-            _session_store = _get_sqlite_session_store()
-            if _session_store:
-                try:
-                    if _session_store.session_exists(sid):
-                        _session_store.delete_session(sid)
-                except Exception:
-                    logger.warning(
-                        "Failed to delete SQLite session %s; refusing to report success",
-                        sid,
-                        exc_info=True,
-                    )
-                    return bad(handler, "Failed to delete session; please retry", 500)
+            try:
+                delete_session_record(sid)
+            except Exception:
+                logger.warning(
+                    "Failed to delete session %s from store; refusing to report success",
+                    sid,
+                    exc_info=True,
+                )
+                return bad(handler, "Failed to delete session; please retry", 500)
             with LOCK:
                 SESSIONS.pop(sid, None)
             sidecar_deleted = False
@@ -22285,7 +22282,7 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
         from api.models import get_session_store
 
         _store = get_session_store()
-        if _store.backend != "json":
+        if _store.supports_generation:
             for _meta in _store.list_sessions():
                 _sid = str(_meta.get("session_id") or "").strip()
                 if not _sid or _sid in phase1_removed_ids:
@@ -22341,7 +22338,7 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
                         from api.models import get_session_store
 
                         _store = get_session_store()
-                        if _store.backend != "json":
+                        if _store.supports_generation:
                             live_ids |= {
                                 str(m.get("session_id"))
                                 for m in _store.list_sessions()

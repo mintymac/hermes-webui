@@ -154,6 +154,8 @@ class WebUIPostgresSessionDB:
     """SessionStore implementation backed by PostgreSQL."""
 
     backend = "postgres"
+    supports_generation = True
+    supports_revision_counter = True
 
     def __init__(self, dsn: str):
         import psycopg
@@ -161,6 +163,7 @@ class WebUIPostgresSessionDB:
         self._dsn = dsn
         self._psycopg = psycopg
         self._local = threading.local()
+        self.unreadable_sids: dict[str, object] = {}
         self._ensure_schema()
 
     def _conn(self):
