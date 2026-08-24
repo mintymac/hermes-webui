@@ -1262,30 +1262,71 @@ _sqlite_session_store_stamp = None
 # reads healthy again, _demote_marked_if_recovered carries any sidecar
 # draft written during the outage into the row and pops the mark. A full
 # save() alone no longer heals the row (removed in blocker 2).
+
+# Per-sid process-local locks serializing unreadable-mark transitions (the
+# mark-set in Session.load's fallback, the mark-pop in Session.save's SQL
+# write path, and the sidecar-read → carry → mark-pop sequence in
+# _demote_marked_if_recovered) against save_metadata's routing decision +
+# write. The WebUI is single-process, so a threading.Lock per sid fully
+# closes the demote-vs-draft race ("recovery can clobber newer drafts"):
+# without it the demote could read the sidecar draft, a concurrent
+# save_metadata could write a newer draft to the sidecar while the mark is
+# still set, and the demote would then pop the mark — stranding the newer
+# draft behind the flip back to SQLite. NOT _get_session_agent_lock: that
+# one is a non-reentrant threading.Lock already held by some save()
+# callers, so re-entering it from save() would deadlock. Mirrors the
+# _JOURNAL_RETRY_LOCKS pattern. Held only across local file/SQL I/O, never
+# across network.
+_DRAFT_DEMOTE_LOCKS: dict[str, threading.Lock] = {}
+_DRAFT_DEMOTE_LOCKS_GUARD = threading.Lock()
+
+
+def _draft_demote_lock_for_sid(sid: str) -> threading.Lock:
+    with _DRAFT_DEMOTE_LOCKS_GUARD:
+        lock = _DRAFT_DEMOTE_LOCKS.get(sid)
+        if lock is None:
+            lock = threading.Lock()
+            _DRAFT_DEMOTE_LOCKS[sid] = lock
+        return lock
+
+
 def _demote_marked_if_recovered(store, sid: str):
     """Probe a marked sid's row; on full-read success, carry any
     marked-window sidecar draft into the row, pop the mark, and return the
     row data. Returns None when the row is still unreadable OR the carry
     failed — in both cases the mark stays so routing remains consistent.
     """
+    # The SQL probe stays outside the per-sid lock: it does not touch the
+    # mark and must not extend the critical section with DB latency.
     try:
         data = store.read_session(sid)
     except Exception:
         return None
     if data is None:
         return None
-    at_mark = store.unreadable_sids.get(sid)
-    try:
-        sc = SESSION_DIR / f'{sid}.json'
-        if sc.exists():
-            live = json.loads(sc.read_text(encoding='utf-8')).get('composer_draft')
-            if live != at_mark:
-                store.update_metadata(sid, {"composer_draft": live})
-                data['composer_draft'] = live
-    except Exception:
-        logger.debug("Failed to carry fallback draft for %s", sid, exc_info=True)
-        return None
-    store.unreadable_sids.pop(sid, None)
+    # The sidecar read → carry → mark-pop sequence must be atomic w.r.t. a
+    # concurrent save_metadata routing on the mark, or a draft written to
+    # the sidecar mid-demote would be stranded the moment the mark pops.
+    with _draft_demote_lock_for_sid(sid):
+        if sid not in store.unreadable_sids:
+            # A concurrent demote already recovered this sid between the
+            # caller's mark check and this lock: return the healthy probe
+            # as-is. Carrying now would be wrong — the sidecar is no longer
+            # the marked authority, and its draft may be older than the
+            # row's (a post-recovery save_metadata already routes to SQL).
+            return data
+        at_mark = store.unreadable_sids.get(sid)
+        try:
+            sc = SESSION_DIR / f'{sid}.json'
+            if sc.exists():
+                live = json.loads(sc.read_text(encoding='utf-8')).get('composer_draft')
+                if live != at_mark:
+                    store.update_metadata(sid, {"composer_draft": live})
+                    data['composer_draft'] = live
+        except Exception:
+            logger.debug("Failed to carry fallback draft for %s", sid, exc_info=True)
+            return None
+        store.unreadable_sids.pop(sid, None)
     return data
 
 
@@ -1630,49 +1671,58 @@ class Session:
         if not is_safe_session_id(self.session_id):
             raise ValueError(f"Unsafe session_id {self.session_id!r}")
         store = get_session_store()
-        # The store being active does not mean THIS session has a SQLite row:
-        # sessions.db can exist while an unmigrated session lives only in its
-        # JSON sidecar (Session.load() falls back to the sidecar). Routing
-        # such a session's draft autosave to SQLite updates zero rows and the
-        # follow-up lookup raises KeyError, losing the draft — so only take
-        # the SQLite path when the row is actually there.
-        if (
-            store.supports_generation
-            and self.session_id not in store.unreadable_sids
-            and store.session_exists(self.session_id)
-        ):
-            # Persist first; apply in-memory only after the write succeeds.
-            # A failed write must leave the cached Session matching what is
-            # actually persisted — otherwise the draft route's unchanged
-            # fast path sees the requested value already in memory and skips
-            # the retry, losing the draft after the next reload.
-            store.update_metadata(self.session_id, fields)
+        # The routing decision (the mark check below) and the write it
+        # selects must be atomic w.r.t. _demote_marked_if_recovered's
+        # sidecar-read → carry → mark-pop: otherwise a draft written to the
+        # sidecar while still marked can be stranded when the demote pops
+        # the mark mid-write ("recovery can clobber newer drafts"). The
+        # per-sid lock covers BOTH the SQL branch and the JSON sidecar
+        # fallback, and wraps only local file/SQL I/O (never network). The
+        # JSON backend is unaffected beyond taking the lock first.
+        with _draft_demote_lock_for_sid(self.session_id):
+            # The store being active does not mean THIS session has a SQLite row:
+            # sessions.db can exist while an unmigrated session lives only in its
+            # JSON sidecar (Session.load() falls back to the sidecar). Routing
+            # such a session's draft autosave to SQLite updates zero rows and the
+            # follow-up lookup raises KeyError, losing the draft — so only take
+            # the SQLite path when the row is actually there.
+            if (
+                store.supports_generation
+                and self.session_id not in store.unreadable_sids
+                and store.session_exists(self.session_id)
+            ):
+                # Persist first; apply in-memory only after the write succeeds.
+                # A failed write must leave the cached Session matching what is
+                # actually persisted — otherwise the draft route's unchanged
+                # fast path sees the requested value already in memory and skips
+                # the retry, losing the draft after the next reload.
+                store.update_metadata(self.session_id, fields)
+                for k, v in fields.items():
+                    setattr(self, k, v)
+                return
+            # JSON fallback: read, update, write back.
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            data.update(fields)
+            tmp = self.path.with_suffix(f".tmp.{os.getpid()}.{threading.current_thread().ident}")
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(data, ensure_ascii=False, indent=2))
+                    f.flush()
+                    os.fsync(f.fileno())
+                _safe_replace(tmp, self.path)
+            except Exception:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
+            # Keep the in-memory object consistent with what was persisted —
+            # but only after the write succeeds. Without this the JSON path
+            # silently relies on the caller having pre-set every field, and a
+            # failed write would leave the cached Session ahead of disk (the
+            # draft route's unchanged fast path would then skip the retry).
             for k, v in fields.items():
                 setattr(self, k, v)
-            return
-        # JSON fallback: read, update, write back.
-        data = json.loads(self.path.read_text(encoding="utf-8"))
-        data.update(fields)
-        tmp = self.path.with_suffix(f".tmp.{os.getpid()}.{threading.current_thread().ident}")
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(json.dumps(data, ensure_ascii=False, indent=2))
-                f.flush()
-                os.fsync(f.fileno())
-            _safe_replace(tmp, self.path)
-        except Exception:
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
-            raise
-        # Keep the in-memory object consistent with what was persisted —
-        # but only after the write succeeds. Without this the JSON path
-        # silently relies on the caller having pre-set every field, and a
-        # failed write would leave the cached Session ahead of disk (the
-        # draft route's unchanged fast path would then skip the retry).
-        for k, v in fields.items():
-            setattr(self, k, v)
 
     def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
         if not is_safe_session_id(self.session_id):
@@ -1784,12 +1834,21 @@ class Session:
                         )
                         self._persisted_generation = _probe.get("generation")
             if not _skip_sql:
-                _write_result = store.write_session(
-                    payload,
-                    expected_generation=getattr(self, "_persisted_generation", None),
-                    force=False,
-                )
-                store.unreadable_sids.pop(self.session_id, None)
+                # The write and the mark-pop must be atomic w.r.t. a
+                # concurrent save_metadata routing on the mark (same
+                # per-sid lock as _demote_marked_if_recovered), or a draft
+                # routed to the sidecar just before the pop would be
+                # stranded behind the flip back to SQL. The index write
+                # below stays OUTSIDE the lock: it takes
+                # LOCK/_INDEX_WRITE_LOCK, which must never nest under the
+                # per-sid demote lock.
+                with _draft_demote_lock_for_sid(self.session_id):
+                    _write_result = store.write_session(
+                        payload,
+                        expected_generation=getattr(self, "_persisted_generation", None),
+                        force=False,
+                    )
+                    store.unreadable_sids.pop(self.session_id, None)
                 if isinstance(_write_result, dict) and _write_result.get("generation") is not None:
                     self._persisted_generation = _write_result["generation"]
                 if not skip_index:
@@ -2059,8 +2118,18 @@ class Session:
             # never be read back. Snapshot the sidecar draft so a later
             # recovery can tell marked-window draft writes apart from a
             # sidecar that simply predates the row. A successful full
-            # save() or read clears the mark.
-            store.unreadable_sids[sid] = data.get("composer_draft")
+            # save() or read clears the mark. The mark check + set run
+            # under the per-sid demote lock, and an existing mark is never
+            # overwritten: refreshing another loader's at-mark snapshot to
+            # a sidecar draft that already includes marked-window writes
+            # would make the demote's carry compare equal and skip it,
+            # losing those drafts on recovery. While the sid is unmarked
+            # the sidecar's draft is stable (marked-window writes are the
+            # only writers and require the mark), so the snapshot taken
+            # from this load's own sidecar read is exact.
+            with _draft_demote_lock_for_sid(sid):
+                if sid not in store.unreadable_sids:
+                    store.unreadable_sids[sid] = data.get("composer_draft")
         return session
 
     @classmethod

@@ -1506,6 +1506,126 @@ def test_metadata_only_demote_carries_marked_draft(monkeypatch):
     assert store.read_metadata_only(sid)["composer_draft"]["text"] == "meta-carried"
 
 
+def test_demote_does_not_clobber_concurrent_draft(monkeypatch):
+    """Demote-vs-draft race: a draft saved while the demote is between its
+    sidecar read and its mark-pop must not be lost. The per-sid demote lock
+    serializes the demote's sidecar-read → carry → mark-pop against
+    save_metadata's routing + write, so the newer draft routes into SQLite
+    and survives the mark popping (on the unfixed tree the demote pops the
+    mark after its stale read and the newer draft is stranded on the
+    sidecar)."""
+    import sqlite3 as _sq
+    import threading
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+
+    sid = "sid-demote-race"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict(sid)
+    payload["composer_draft"] = {"text": "D1", "files": []}
+    store.write_session(payload)
+    sidecar = d / f"{sid}.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    # Transient failure with a sidecar: fallback load succeeds, sid marked
+    # with the sidecar's D1 draft snapshot.
+    s = models.Session.load(sid)
+    assert s is not None
+    assert sid in store.unreadable_sids
+
+    # Instrument the demote's sidecar read: the FIRST read of this sidecar
+    # (the demote's) reports entry and then blocks until released; a later
+    # read (the concurrent save_metadata's JSON-fallback read on the unfixed
+    # tree) reports that the draft writer committed to the sidecar route.
+    entered = threading.Event()
+    writer_committed = threading.Event()
+    proceed = threading.Event()
+    real_read_text = Path.read_text
+    gate = {"armed": True}
+
+    def gated_read_text(self_path, *args, **kwargs):
+        content = real_read_text(self_path, *args, **kwargs)
+        if self_path == sidecar:
+            if gate["armed"]:
+                gate["armed"] = False
+                entered.set()
+                proceed.wait(timeout=30)
+            elif entered.is_set():
+                writer_committed.set()
+        return content
+
+    monkeypatch.setattr(Path, "read_text", gated_read_text)
+
+    # On the fixed tree, save_metadata takes the per-sid demote lock before
+    # routing; signal when it reaches for the lock so the demote can be
+    # released while the writer is serialized behind it. Absent on the
+    # parent tree, where the sidecar-read signal above fires instead.
+    real_lock_for_sid = getattr(models, "_draft_demote_lock_for_sid", None)
+    if real_lock_for_sid is not None:
+        def releasing_lock_for_sid(sid_):
+            lock = real_lock_for_sid(sid_)
+            writer_committed.set()
+            return lock
+
+        monkeypatch.setattr(
+            models, "_draft_demote_lock_for_sid", releasing_lock_for_sid
+        )
+
+    errors = []
+
+    def _demote():
+        try:
+            models.Session.load(sid)
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            errors.append(exc)
+
+    def _save_draft():
+        try:
+            s.save_metadata({"composer_draft": {"text": "D2", "files": []}})
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            errors.append(exc)
+
+    t1 = threading.Thread(target=_demote, daemon=True)
+    t1.start()
+    t2 = None
+    try:
+        assert entered.wait(timeout=30), "demote never reached the sidecar read"
+        t2 = threading.Thread(target=_save_draft, daemon=True)
+        t2.start()
+        assert writer_committed.wait(timeout=30), (
+            "concurrent draft save never engaged"
+        )
+    finally:
+        proceed.set()
+    t1.join(timeout=30)
+    t2.join(timeout=30)
+    assert not t1.is_alive(), "demote thread did not finish"
+    assert not t2.is_alive(), "draft writer thread did not finish"
+    assert not errors
+
+    # The mark is cleared and the NEWER draft wins: on the unfixed tree the
+    # demote pops the mark after its stale D1 read, stranding D2 on the
+    # sidecar (SQLite still holds D1); with the per-sid lock the writer is
+    # serialized after the pop and routes D2 into SQLite.
+    assert sid not in store.unreadable_sids
+    final = store.read_metadata_only(sid)
+    assert final["composer_draft"]["text"] == "D2"
+
+
 def test_ephemeral_cancel_cleanup_deletes_store_row(monkeypatch):
     """DB-only ephemeral cancel cleanup must delete the row (gate finding)."""
     import api.streaming as streaming
