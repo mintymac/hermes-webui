@@ -10,11 +10,17 @@ Capabilities
 ------------
 Backends declare capabilities instead of classes: production code branches
 on ``supports_generation`` (durable per-session generation CAS + cutover
-markers + unreadable-row recovery state) and ``supports_revision_counter``
-(meta-table revision for cache invalidation). The JSON sidecar backend has
-neither: its writes are atomic-replace (last writer wins by file semantics)
-and its freshness signal is the directory mtime. The ``backend`` tag is
-informational (logging/tests) only — never a dispatch condition.
+markers + unreadable-row recovery state), ``supports_revision_counter``
+(meta-table revision for cache invalidation), and
+``persists_without_sidecar`` (sessions survive with no JSON sidecar on
+disk — SQLite/Postgres = True, JSON = False). The last is a topology axis,
+distinct from CAS (``supports_generation``) and cache
+(``supports_revision_counter``): it tells lifecycle call sites (existence
+checks, index rebuilds, lineage scans) that the store is the authoritative
+place to look when no sidecar exists. The JSON sidecar backend has none of
+the three: its writes are atomic-replace (last writer wins by file
+semantics) and its freshness signal is the directory mtime. The ``backend``
+tag is informational (logging/tests) only — never a dispatch condition.
 
 Deliberate boundary: ``Session.save()`` keeps its legacy inline JSON writer
 for the sidecar backend (field-ordered metadata prefix, legacy-facts
@@ -90,8 +96,9 @@ class SessionStore(Protocol):
           is unlinked only by cleanup/delete, never by recreate.
 
         The returned dict carries the new ``generation``.
-        JSON backends accept all three kwargs for parity and ignore them
-        (last-writer-wins atomic replace).
+        JSON backends accept only ``expected_generation``/``force`` (both
+        ignored — last-writer-wins atomic replace); ``fresh_incarnation``
+        is SQL-only and must not be passed to a JSON store.
         """
         ...
 

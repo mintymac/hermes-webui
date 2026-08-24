@@ -10,6 +10,7 @@ same suite — that is what proves the abstraction holds. Currently exercised:
 """
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -254,3 +255,132 @@ def test_cutover_marker_blocks_incomplete_migration(sql_store):
     assert sql_store.is_active() is False
     sql_store.set_meta("migration_complete", "1")
     assert sql_store.is_active() is True
+
+
+def test_update_metadata_preserves_unknown_keys(store):
+    """One metadata policy: unknown top-level keys persist on every backend
+    (JSON sidecar dict, SQL extra_json); only _UNSAFE_FIELDS are rejected."""
+    store.write_session(_sample("c11"))
+    store.update_metadata("c11", {"future_field": {"nested": [1, 2]}})
+    loaded = store.read_session("c11")
+    assert loaded["future_field"] == {"nested": [1, 2]}
+    assert len(loaded["messages"]) == 2
+    with pytest.raises(ValueError):
+        store.update_metadata("c11", {"messages": []})
+
+
+def test_is_active_fails_closed_on_marker_read_error(sql_store):
+    """A store whose cutover markers cannot be read has no authority."""
+    original_conn = sql_store._conn
+
+    def _boom():
+        raise RuntimeError("connection lost")
+
+    sql_store._conn = _boom
+    try:
+        assert sql_store.is_active() is False
+    finally:
+        sql_store._conn = original_conn
+
+
+def test_configured_postgres_lifecycle_paths(monkeypatch, tmp_path):
+    """Configured Postgres drives the production lifecycle paths end to end:
+    store selection (fail-closed), Session.save/load, workspace-binding
+    recovery on a DB-only SID, index existence/rebuild, compression-parent
+    lookup, and lifecycle_delete. Skips only when no DSN is configured; a
+    configured-but-unreachable DSN is a failure, not a skip."""
+    dsn = os.environ.get("HERMES_TEST_PG_DSN")
+    if not dsn:
+        pytest.skip("HERMES_TEST_PG_DSN not set")
+
+    import api.models as models
+
+    monkeypatch.setenv("HERMES_SESSION_STORE_PG_DSN", dsn)
+    monkeypatch.setattr(models, "_pg_session_store_instance", None)
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", tmp_path / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", {})
+
+    store = models.get_session_store()
+    assert store.persists_without_sidecar is True
+
+    conn = store._conn()
+    with conn:
+        conn.execute(
+            "TRUNCATE sessions, messages, tool_calls, context_messages, anchor_scenes, session_incarnations"
+        )
+
+    # Session.save/load through the model layer on the configured PG store.
+    s = models.Session(
+        session_id="pg-life",
+        title="PG lifecycle",
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    s.save()
+    loaded = models.Session.load("pg-life")
+    assert loaded is not None and loaded.title == "PG lifecycle"
+
+    # Workspace-binding recovery on a DB-only SID (no sidecar exists).
+    current_ws = str(loaded.workspace)
+    new_ws = str((tmp_path / "recovered").resolve())
+    models.persist_recovered_workspace_binding(
+        loaded, new_ws, expected_workspace=current_ws
+    )
+    assert store.read_metadata_only("pg-life")["workspace"] == new_ws
+
+    # Index existence + full rebuild see the DB-only session.
+    assert models._index_entry_exists("pg-life", in_memory_ids=set()) is True
+    with models.LOCK:
+        models.SESSIONS.clear()
+    models._write_session_index(updates=None)
+    index_entries = json.loads(models.SESSION_INDEX_FILE.read_text())
+    assert any(e.get("session_id") == "pg-life" for e in index_entries)
+
+    # Compression-parent lookup via the store's lineage rows.
+    child = models.Session(
+        session_id="pg-child",
+        title="child",
+        parent_session_id="pg-life",
+        messages=[{"role": "user", "content": "c"}],
+    )
+    child.save()
+    # Isolate the store-scan path: drop in-memory and index evidence.
+    with models.LOCK:
+        models.SESSIONS.clear()
+    models.SESSION_INDEX_FILE.unlink(missing_ok=True)
+    parent_view = models.Session.load("pg-life")
+    assert models._has_compression_continuation(parent_view) is True
+
+    # lifecycle_delete with durable retry ownership.
+    result = store.lifecycle_delete("pg-child", owner="test-lifecycle")
+    assert result["ok"] is True and result["existed"] is True
+    assert store.session_exists("pg-child") is False
+
+    # is_active fails closed when the markers cannot be read.
+    original_conn = store._conn
+
+    def _boom():
+        raise RuntimeError("connection lost")
+
+    store._conn = _boom
+    try:
+        assert store.is_active() is False
+    finally:
+        store._conn = original_conn
+
+    # The selector never returns an inactive PG store: a configured DSN with
+    # incomplete migration markers refuses instead of falling back.
+    store.set_meta("created_by", "migration")
+    store.set_meta("migration_complete", "0")
+    monkeypatch.setattr(models, "_pg_session_store_instance", None)
+    try:
+        with pytest.raises(RuntimeError):
+            models.get_session_store()
+    finally:
+        # Restore a clean app database for other tests sharing this DSN.
+        store.set_meta("created_by", "app")
+        conn = store._conn()
+        with conn:
+            conn.execute("DELETE FROM meta WHERE key = 'migration_complete'")
+        store.close()

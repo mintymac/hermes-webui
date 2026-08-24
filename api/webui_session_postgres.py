@@ -7,9 +7,10 @@ context_messages/anchor_scenes model, ``extra_json`` as JSONB, a meta table
 for the revision counter and cutover markers, and the same stale-writer
 fenced upsert.
 
-Not wired into production config yet — used by the backend contract tests
-(tests/test_session_store_contract.py) and as the reference for future
-network backends.
+Not wired into production config files — selected at runtime by
+``api.models.get_session_store()`` when ``HERMES_SESSION_STORE_PG_DSN`` is
+set (fail-closed on an inactive store), and exercised by the backend
+contract tests (tests/test_session_store_contract.py).
 """
 from __future__ import annotations
 
@@ -177,11 +178,13 @@ class WebUIPostgresSessionDB:
     backend = "postgres"
     supports_generation = True
     supports_revision_counter = True
+    persists_without_sidecar = True
 
-    def __init__(self, dsn: str):
+    def __init__(self, dsn: str, *, created_by: str = "app"):
         import psycopg
 
         self._dsn = dsn
+        self._created_by = created_by
         self._psycopg = psycopg
         self._local = threading.local()
         self.unreadable_sids: dict[str, object] = {}
@@ -217,10 +220,21 @@ class WebUIPostgresSessionDB:
             )
             if conn.execute("SELECT 1 FROM meta WHERE key = 'created_by'").fetchone() is None:
                 has_rows = conn.execute("SELECT 1 FROM sessions LIMIT 1").fetchone() is not None
-                conn.execute(
-                    "INSERT INTO meta (key, value) VALUES ('created_by', %s)",
-                    ("legacy" if has_rows else "app",),
-                )
+                if self._created_by == "migration":
+                    # Staged from creation: a database the migration script
+                    # opens is incomplete until the script publishes it, even
+                    # if this process dies before writing a single row.
+                    conn.execute(
+                        "INSERT INTO meta (key, value) VALUES ('created_by', 'migration')"
+                    )
+                    conn.execute(
+                        "INSERT INTO meta (key, value) VALUES ('migration_complete', '0')"
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO meta (key, value) VALUES ('created_by', %s)",
+                        ("legacy" if has_rows else "app",),
+                    )
 
     def close(self) -> None:
         conn = getattr(self._local, "conn", None)
@@ -264,14 +278,25 @@ class WebUIPostgresSessionDB:
             return None
 
     def is_active(self) -> bool:
+        """Durable cutover check, fail-closed (mirrors the SQLite store).
+
+        Authority requires readable, recognizable markers: an app-created or
+        legacy (pre-marker) database is active; a migration database is only
+        active once migration_complete=1. Unreadable, missing, or unknown
+        markers deny authority — a configured Postgres store must never fail
+        open.
+        """
         try:
             rows = self._conn().execute("SELECT key, value FROM meta").fetchall()
             meta = {row[0]: row[1] for row in rows}
         except Exception:
-            return True
-        if meta.get("created_by") == "migration" and meta.get("migration_complete") != "1":
             return False
-        return True
+        created_by = meta.get("created_by")
+        if created_by == "migration":
+            return meta.get("migration_complete") == "1"
+        if created_by in ("app", "legacy"):
+            return True
+        return False
 
     # -- reads -------------------------------------------------------------
 
@@ -606,13 +631,14 @@ class WebUIPostgresSessionDB:
         lease keyed by ``sid`` so the retry owner survives a crash. Never
         touches the JSON sidecar.
         """
-        conn = self._conn()
         try:
             existed = self.delete_session(sid)
         except Exception as exc:
-            conn.rollback()
+            # psycopg3 closes the connection at the end of each `with conn:`
+            # block, so every step below re-fetches a live connection.
+            self._conn().rollback()
             error = f"{type(exc).__name__}: {exc}"
-            with conn:
+            with self._conn() as conn:
                 conn.execute(
                     "INSERT INTO cleanup_leases "
                     "(session_id, owner, error, updated_at, attempts) "
@@ -628,7 +654,7 @@ class WebUIPostgresSessionDB:
             except Exception:
                 existed = False
             return {"ok": False, "error": error, "existed": existed}
-        with conn:
+        with self._conn() as conn:
             conn.execute("DELETE FROM cleanup_leases WHERE session_id = %s", (sid,))
         return {"ok": True, "existed": bool(existed)}
 

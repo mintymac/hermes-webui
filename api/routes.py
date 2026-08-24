@@ -8549,12 +8549,12 @@ def _is_pre_compression_snapshot_id(session_id: str) -> bool:
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
             return bool(data.get("pre_compression_snapshot"))
-        # Migrated sessions have no sidecar; check the SQLite store so
+        # Migrated sessions have no sidecar; check the active store so
         # compression continuation rows keep their sidebar lineage grouping.
-        from api.models import _get_sqlite_session_store
+        from api.models import get_session_store
 
-        store = _get_sqlite_session_store()
-        if store:
+        store = get_session_store()
+        if getattr(store, "persists_without_sidecar", False):
             meta = store.read_metadata_only(sid)
             if meta is not None:
                 return bool(meta.get("pre_compression_snapshot"))

@@ -328,6 +328,7 @@ class WebUISqliteSessionDB:
     backend = "sqlite"
     supports_generation = True
     supports_revision_counter = True
+    persists_without_sidecar = True
 
     def __init__(
         self,

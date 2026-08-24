@@ -86,6 +86,7 @@ class WebUIJsonSessionDB:
     backend = "json"
     supports_generation = False
     supports_revision_counter = False
+    persists_without_sidecar = False
 
     def __init__(self, session_dir: Path | str | None = None):
         self._session_dir = Path(session_dir).expanduser().resolve() if session_dir else None
@@ -127,15 +128,19 @@ class WebUIJsonSessionDB:
         return copy.deepcopy(data)
 
     def update_metadata(self, sid: str, fields: dict[str, Any]) -> dict[str, Any]:
-        """Persist allowlisted metadata fields while preserving messages.
+        """Persist metadata fields while preserving messages.
 
-        This dormant adapter method is for migration experiments and tests only.
-        Runtime wiring must add Session lock/cache/index parity before using it
-        from live WebUI routes.
+        Unknown top-level keys are accepted and persisted on the sidecar
+        dict, matching the SQL backends' ``extra_json`` policy (one metadata
+        policy across backends). Only ``_UNSAFE_FIELDS`` (``session_id``,
+        ``messages``, ``tool_calls``, ``message_count``) are rejected.
+
+        Runtime wiring must add Session lock/cache/index parity before using
+        it from live WebUI routes.
         """
         if not isinstance(fields, dict):
             raise TypeError("fields must be a dict")
-        unsafe = sorted((set(fields) & _UNSAFE_FIELDS) | (set(fields) - _METADATA_FIELDS))
+        unsafe = sorted(set(fields) & _UNSAFE_FIELDS)
         if unsafe:
             raise ValueError(f"Unsafe session metadata fields: {', '.join(unsafe)}")
 

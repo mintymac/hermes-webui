@@ -304,9 +304,9 @@ def _session_dir_has_persisted_session_files() -> bool:
             return True
     except Exception:
         pass
-    # Also count SQLite-backed sessions.
+    # Also count store-backed sessions with no JSON sidecar.
     try:
-        store = _get_sqlite_session_store()
+        store = _active_session_store_if_sidecarless()
         if store and store.list_sessions():
             return True
     except Exception:
@@ -379,10 +379,10 @@ def _index_entry_exists(session_id: str, in_memory_ids=None) -> bool:
     p = SESSION_DIR / f'{session_id}.json'
     if p.exists():
         return True
-    # SQLite-backed sessions have no JSON sidecar.
+    # Sidecarless stores (SQLite/Postgres) persist sessions with no JSON sidecar.
     try:
-        store = _get_sqlite_session_store()
-        if store and store.read_session(session_id) is not None:
+        store = _active_session_store_if_sidecarless()
+        if store and store.session_exists(session_id):
             return True
     except Exception:
         pass
@@ -432,9 +432,9 @@ def _write_session_index(updates=None, *, session_dir: Path | None = None, sessi
                                 entry_map[sid] = c
                 except Exception:
                     logger.debug("Failed to load session from %s", p)
-            # Include SQLite-backed sessions in full rebuilds.
+            # Include store-backed sessions (no sidecar) in full rebuilds.
             try:
-                store = _get_sqlite_session_store()
+                store = _active_session_store_if_sidecarless()
                 if store:
                     for meta in store.list_sessions():
                         sid = meta.get('session_id')
@@ -445,7 +445,7 @@ def _write_session_index(updates=None, *, session_dir: Path | None = None, sessi
                             if s:
                                 entry_map[sid] = s.compact()
                         except Exception:
-                            logger.debug("Failed to load SQLite session %s", sid)
+                            logger.debug("Failed to load store-backed session %s", sid)
             except Exception:
                 pass
             entries = list(entry_map.values())
@@ -1302,7 +1302,21 @@ def get_session_store():
     if _pg_dsn:
         from api.webui_session_postgres import WebUIPostgresSessionDB
 
-        _pg_session_store_instance = WebUIPostgresSessionDB(_pg_dsn)
+        store = WebUIPostgresSessionDB(_pg_dsn)
+        if not store.is_active():
+            # Fail closed: a configured-but-inactive Postgres store must not
+            # silently fall back to SQLite/JSON while PG is believed
+            # configured. Refuse to serve a store at all.
+            try:
+                store.close()
+            except Exception:
+                pass
+            raise RuntimeError(
+                "HERMES_SESSION_STORE_PG_DSN is configured but the Postgres "
+                "session store is inactive (unreadable or unrecognized cutover "
+                "markers); refusing to fall back to another backend"
+            )
+        _pg_session_store_instance = store
         return _pg_session_store_instance
     store = _get_sqlite_session_store()
     if store:
@@ -1310,6 +1324,22 @@ def get_session_store():
     from api.webui_session_db import WebUIJsonSessionDB
 
     return WebUIJsonSessionDB(session_dir=SESSION_DIR)
+
+
+def _active_session_store_if_sidecarless():
+    """Return the active session store iff it persists without JSON sidecars.
+
+    Lifecycle paths (existence checks, index rebuilds, lineage scans) use
+    this to consult the store only when it is the authoritative place a
+    sidecarless session could live (``persists_without_sidecar`` —
+    SQLite/Postgres). Returns None for the JSON backend or when the store
+    cannot be constructed, so callers keep their sidecar-only behavior.
+    """
+    try:
+        store = get_session_store()
+    except Exception:
+        return None
+    return store if getattr(store, "persists_without_sidecar", False) else None
 
 
 def delete_session_record(sid: str, *, owner: str = "delete_route") -> bool:
@@ -4006,6 +4036,15 @@ def _has_compression_continuation(session) -> bool:
     except Exception:
         logger.debug("Failed to inspect session index for compression continuation", exc_info=True)
 
+    # Sidecarless stores (SQLite/Postgres) hold compression children that
+    # have no JSON sidecar; scan their metadata rows for the lineage.
+    try:
+        store = _active_session_store_if_sidecarless()
+        if store and any(_row_is_continuation(r) for r in store.list_sessions()):
+            return True
+    except Exception:
+        logger.debug("Failed to scan session store for compression continuation", exc_info=True)
+
     # Index rows can lag behind rapid compression/save races. Fall back to a
     # shallow JSON metadata scan; session files write parent_session_id before
     # the messages array, so this avoids loading multi-MB transcripts.
@@ -4789,6 +4828,16 @@ def _persisted_message_count(sid) -> int | None:
         return None
     p = SESSION_DIR / f'{sid}.json'
     if not p.exists():
+        # No sidecar: a sidecarless store (SQLite/Postgres) may still hold
+        # the session's authoritative message count.
+        try:
+            store = _active_session_store_if_sidecarless()
+            if store:
+                meta = store.read_metadata_only(sid)
+                if meta is not None:
+                    return _parse_nonnegative_int(meta.get('message_count'))
+        except Exception:
+            pass
         return None
     try:
         prefix = _read_metadata_json_prefix(p)
@@ -4867,10 +4916,11 @@ def _persisted_session_meta_prefix(sid) -> dict | None:
 
 
 def _session_sidecar_exists(sid) -> bool | None:
-    """Return whether *sid*'s sidecar file exists on disk.
+    """Return whether *sid* has confirmed persisted state.
 
-    True  = the sidecar is confirmed present.
-    False = the sidecar is confirmed absent (a truly never-persisted session).
+    True  = persistence confirmed (sidecar present, or the session lives in
+            a sidecarless store — SQLite/Postgres).
+    False = confirmed absent (a truly never-persisted session).
     None  = existence is indeterminate (unsafe id, or the stat raised).
 
     ``_session_is_evictable`` uses this to distinguish a genuinely
@@ -4880,9 +4930,19 @@ def _session_sidecar_exists(sid) -> bool | None:
     if not is_safe_session_id(sid):
         return None
     try:
-        return (SESSION_DIR / f'{sid}.json').exists()
+        if (SESSION_DIR / f'{sid}.json').exists():
+            return True
     except OSError:
         return None
+    # Sidecar absent: a sidecarless store (SQLite/Postgres) decides whether
+    # the session is persisted at all.
+    try:
+        store = _active_session_store_if_sidecarless()
+        if store is not None:
+            return store.session_exists(sid)
+    except Exception:
+        return None
+    return False
 
 
 # Grace window (seconds) during which a never-persisted, empty, draftless session
@@ -5986,9 +6046,12 @@ def persist_recovered_workspace_binding(
 ):
     """Atomically persist only a recovered session's workspace binding.
 
-    Existing sidecars are patched as raw JSON so metadata-only callers never
-    reserialize (or otherwise clobber) the transcript. Missing sidecars fail
-    closed so recovery cannot resurrect a concurrently deleted session. The
+    Store-only for every backend: the canonical store (JSON sidecar adapter,
+    SQLite, or Postgres) owns the compare-and-replace via
+    ``session_exists`` → ``read_metadata_only`` → ``update_metadata``.
+    Sessions the store does not hold fail closed so recovery cannot
+    resurrect a concurrently deleted session — and a leftover sidecar of a
+    migrated (SQL-owned) session is stale and never patched. The
     per-session mutation lock keeps compare-and-replace ordered with other
     compliant session writers.
     """
@@ -6004,76 +6067,34 @@ def persist_recovered_workspace_binding(
         else expected_workspace
     )
     expected = str(expected_value or "")
-    path = SESSION_DIR / f"{sid}.json"
     lock = _get_session_agent_lock(sid)
     with lock:
-        _store_patched = False
-        store = _get_sqlite_session_store()
-        if store and store.session_exists(sid):
-            # Migrated sessions have no sidecar to patch: apply the same
-            # compare-and-replace to the row via the canonical metadata write.
-            try:
-                meta = store.read_metadata_only(sid) or {}
-            except Exception as exc:
-                raise WorkspaceBindingPersistenceError(
-                    "Failed to persist recovered workspace: unreadable session row"
-                ) from exc
-            current = str(meta.get("workspace") or "")
-            if current != resolved:
-                if current != expected:
-                    raise WorkspaceBindingPersistenceError(
-                        "Failed to persist recovered workspace: session workspace changed"
-                    )
-                try:
-                    store.update_metadata(sid, {"workspace": resolved})
-                except Exception as exc:
-                    raise WorkspaceBindingPersistenceError(
-                        "Failed to persist recovered workspace"
-                    ) from exc
-            _store_patched = True
-        if not _store_patched and not path.exists():
-            # Recovery only repairs an existing WebUI sidecar. Creating a new
-            # sidecar here can resurrect a session that was deleted after the
+        store = get_session_store()
+        if not store.session_exists(sid):
+            # Recovery only repairs an existing persisted session. Creating
+            # state here can resurrect a session that was deleted after the
             # recovery decision but before this lock was acquired.
             raise WorkspaceBindingPersistenceError(
                 "Failed to persist recovered workspace: session sidecar is missing"
             )
-
-        if not _store_patched:
+        try:
+            meta = store.read_metadata_only(sid) or {}
+        except Exception as exc:
+            raise WorkspaceBindingPersistenceError(
+                "Failed to persist recovered workspace: unreadable session record"
+            ) from exc
+        current = str(meta.get("workspace") or "")
+        if current != resolved:
+            if current != expected:
+                raise WorkspaceBindingPersistenceError(
+                    "Failed to persist recovered workspace: session workspace changed"
+                )
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                store.update_metadata(sid, {"workspace": resolved})
             except Exception as exc:
                 raise WorkspaceBindingPersistenceError(
-                    "Failed to persist recovered workspace: unreadable session sidecar"
+                    "Failed to persist recovered workspace"
                 ) from exc
-            if not isinstance(payload, dict):
-                raise WorkspaceBindingPersistenceError(
-                    "Failed to persist recovered workspace: invalid session sidecar"
-                )
-            current = str(payload.get("workspace") or "")
-            if current != resolved:
-                if current != expected:
-                    raise WorkspaceBindingPersistenceError(
-                        "Failed to persist recovered workspace: session workspace changed"
-                    )
-                payload["workspace"] = resolved
-                tmp = path.with_suffix(
-                    f".tmp.{os.getpid()}.{threading.current_thread().ident}"
-                )
-                try:
-                    with open(tmp, "w", encoding="utf-8") as handle:
-                        json.dump(payload, handle, ensure_ascii=False, indent=2)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    _safe_replace(tmp, path)
-                except Exception as exc:
-                    try:
-                        tmp.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    raise WorkspaceBindingPersistenceError(
-                        "Failed to persist recovered workspace"
-                    ) from exc
 
         session.workspace = resolved
         with LOCK:
