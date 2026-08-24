@@ -265,10 +265,36 @@ CREATE INDEX IF NOT EXISTS idx_sessions_archived ON sessions(archived, updated_a
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, idx);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id, idx);
 CREATE INDEX IF NOT EXISTS idx_context_messages_session ON context_messages(session_id, idx);
+
+-- Per-SID incarnation authority (schema v5). Deliberately NON-cascading:
+-- no FK to sessions, no ON DELETE CASCADE. This row survives delete_session()
+-- and is the durable record that a SID once existed, so a stale writer
+-- holding a pre-delete generation cannot resurrect the transcript by
+-- re-inserting at generation 1.
+--   incarnation: last issued incarnation for the SID (bumps only on a
+--                leased recreate, never on delete).
+--   retired:     1 when no live sessions row exists for the SID.
+--   retired_generation: last live generation at delete (0 if never written).
+CREATE TABLE IF NOT EXISTS session_incarnations (
+    session_id TEXT PRIMARY KEY,
+    incarnation INTEGER NOT NULL,
+    retired INTEGER NOT NULL DEFAULT 0,
+    retired_generation INTEGER NOT NULL DEFAULT 0
+);
+
+-- Placeholder for the cleanup-lease protocol (created in the v5 bump so the
+-- version moves exactly once; behavior lands separately).
+CREATE TABLE IF NOT EXISTS cleanup_leases (
+    session_id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    error TEXT,
+    updated_at REAL NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 1
+);
 """
 
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 _META_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -354,6 +380,13 @@ class WebUISqliteSessionDB:
             if col not in existing:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {ddl}")
         conn.executescript(_META_SQL)
+        # v5 backfill: pre-existing rows predate the incarnation authority;
+        # seed each live SID at incarnation 1, not retired.
+        conn.execute(
+            "INSERT OR IGNORE INTO session_incarnations "
+            "(session_id, incarnation, retired, retired_generation) "
+            "SELECT session_id, 1, 0, 0 FROM sessions"
+        )
         # Durable cutover marker. Fresh app-created databases seed 'app';
         # a db with rows but no meta predates markers ('legacy'); the
         # migration script overwrites with 'migration' + migration_complete.
@@ -522,6 +555,7 @@ class WebUISqliteSessionDB:
         *,
         expected_generation: int | None = None,
         force: bool = False,
+        fresh_incarnation: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(session, dict):
             raise TypeError("session must be a dict")
@@ -545,6 +579,7 @@ class WebUISqliteSessionDB:
             self._write_session_row(
                 conn, sid, payload,
                 expected_generation=expected_generation, force=force,
+                fresh_incarnation=fresh_incarnation,
             )
             self._write_messages(conn, sid, messages)
             self._write_tool_calls(conn, sid, tool_calls)
@@ -637,11 +672,28 @@ class WebUISqliteSessionDB:
         conn = self._conn()
         with conn:
             self._bump_revision(conn)
+            row = conn.execute(
+                "SELECT generation FROM sessions WHERE session_id = ?", (sid,)
+            ).fetchone()
+            old_generation = int(row["generation"] or 0) if row is not None else 0
             cur = conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
             conn.execute("DELETE FROM tool_calls WHERE session_id = ?", (sid,))
             conn.execute("DELETE FROM context_messages WHERE session_id = ?", (sid,))
             conn.execute("DELETE FROM anchor_scenes WHERE session_id = ?", (sid,))
+            if cur.rowcount > 0:
+                # Retire the SID in the incarnation authority (which survives
+                # the delete) so a stale pre-delete writer cannot resurrect
+                # the transcript. The incarnation counter does NOT move on
+                # delete — only a leased recreate advances it.
+                conn.execute(
+                    "INSERT INTO session_incarnations "
+                    "(session_id, incarnation, retired, retired_generation) "
+                    "VALUES (?, 1, 1, ?) "
+                    "ON CONFLICT(session_id) DO UPDATE SET "
+                    "retired = 1, retired_generation = excluded.retired_generation",
+                    (sid, old_generation),
+                )
         return cur.rowcount > 0
 
     def archive(self, sid: str, archived: bool = True) -> dict[str, Any]:
@@ -659,6 +711,7 @@ class WebUISqliteSessionDB:
         *,
         expected_generation: int | None = None,
         force: bool = False,
+        fresh_incarnation: bool = False,
     ) -> None:
         cols = ["session_id"]
         vals: list[Any] = [sid]
@@ -700,30 +753,92 @@ class WebUISqliteSessionDB:
         vals.append(_json_dump(null_fields) if null_fields else None)
 
         # Stale-writer fence: a durable per-session generation compared and
-        # bumped atomically. updated_at cannot fence real stale Session
+        # bumped atomically, backed by the per-SID incarnation authority so a
+        # delete is not forgetful. updated_at cannot fence real stale Session
         # objects — save() stamps time.time() before writing — so writers
         # must carry the generation their object was loaded with.
-        #   - row absent: insert generation 1.
+        # Live row:
         #   - force: deliberate heal/import — bump and overwrite.
         #   - expected_generation == row generation: bump and overwrite.
         #   - anything else (stale or lineage-unknown): refuse loudly.
+        # Absent row (force NEVER inserts; fresh_incarnation is the only
+        # lease, reserved for an explicit recreate API):
+        #   - no authority + expected_generation None: first create
+        #     (authority (sid, 1, 0, 0) + row generation 1).
+        #   - no authority + expected_generation set: DeletedSessionWriteError.
+        #   - authority retired + expected_generation set:
+        #     DeletedSessionWriteError (stale writer after delete).
+        #   - authority retired + no lineage + no lease:
+        #     RetiredSessionWriteError (explicit recreate requires the lease).
+        #   - authority retired + fresh_incarnation: lease — incarnation+1,
+        #     retired=0, row generation 1.
+        #   - authority not retired but row absent (orphan): fail closed.
         row = conn.execute(
             "SELECT generation FROM sessions WHERE session_id = ?", (sid,)
         ).fetchone()
         current_generation = int(row["generation"] or 0) if row is not None else None
-        if current_generation is None:
-            new_generation = 1
-        elif force:
-            new_generation = current_generation + 1
-        elif expected_generation is None or int(expected_generation) != current_generation:
-            raise StaleSessionWriteError(
-                f"Refusing to overwrite session {sid!r}: expected generation "
-                f"{expected_generation!r} != persisted {current_generation!r} "
-                f"(stale writer or unloaded lineage; use force only for "
-                f"deliberate heals)"
-            )
+        if current_generation is not None:
+            if force:
+                new_generation = current_generation + 1
+            elif expected_generation is None or int(expected_generation) != current_generation:
+                raise StaleSessionWriteError(
+                    f"Refusing to overwrite session {sid!r}: expected generation "
+                    f"{expected_generation!r} != persisted {current_generation!r} "
+                    f"(stale writer or unloaded lineage; use force only for "
+                    f"deliberate heals)"
+                )
+            else:
+                new_generation = current_generation + 1
         else:
-            new_generation = current_generation + 1
+            authority = conn.execute(
+                "SELECT incarnation, retired FROM session_incarnations "
+                "WHERE session_id = ?",
+                (sid,),
+            ).fetchone()
+            if authority is None:
+                if expected_generation is not None:
+                    raise DeletedSessionWriteError(
+                        f"Refusing to write session {sid!r}: writer carries "
+                        f"generation {expected_generation!r} but no session was "
+                        f"ever persisted under this id (deleted or never existed)"
+                    )
+                # First create: issue incarnation 1 for the SID.
+                conn.execute(
+                    "INSERT INTO session_incarnations "
+                    "(session_id, incarnation, retired, retired_generation) "
+                    "VALUES (?, 1, 0, 0)",
+                    (sid,),
+                )
+                new_generation = 1
+            elif not int(authority["retired"]):
+                raise StaleSessionWriteError(
+                    f"Refusing to write session {sid!r}: incarnation authority "
+                    f"says the session is live but the row is absent "
+                    f"(orphaned authority; failing closed)"
+                )
+            elif expected_generation is not None:
+                raise DeletedSessionWriteError(
+                    f"Refusing to write session {sid!r}: writer carries "
+                    f"generation {expected_generation!r} from before the "
+                    f"session was deleted (stale writer after delete)"
+                )
+            elif not fresh_incarnation:
+                raise RetiredSessionWriteError(
+                    f"Refusing to recreate session {sid!r}: the id is retired "
+                    f"(deleted); only an explicit recreate with "
+                    f"fresh_incarnation=True may lease a new incarnation"
+                )
+            else:
+                # Leased recreate: a new incarnation of the SID starts at
+                # generation 1. A leftover sidecar of the old incarnation is
+                # stale — only cleanup/delete unlinks it, never recreate.
+                conn.execute(
+                    "UPDATE session_incarnations "
+                    "SET incarnation = incarnation + 1, retired = 0 "
+                    "WHERE session_id = ?",
+                    (sid,),
+                )
+                new_generation = 1
 
         cols.append("generation")
         vals.append(new_generation)
@@ -833,6 +948,15 @@ class WebUISqliteSessionDB:
 
 class StaleSessionWriteError(RuntimeError):
     """A full-session write tried to overwrite a newer persisted generation."""
+
+
+class DeletedSessionWriteError(StaleSessionWriteError):
+    """A writer carrying pre-delete lineage tried to write a deleted session."""
+
+
+class RetiredSessionWriteError(StaleSessionWriteError):
+    """A write tried to recreate a retired (deleted) session id without a
+    fresh-incarnation lease."""
 
 
 def _is_safe_session_id(sid: Any) -> bool:

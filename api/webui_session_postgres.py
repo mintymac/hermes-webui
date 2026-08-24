@@ -23,6 +23,8 @@ from api.webui_session_sqlite import (
     _SESSION_BOOL_FIELDS,
     _SESSION_JSON_FIELDS,
     _SESSION_SCALAR_FIELDS,
+    DeletedSessionWriteError,
+    RetiredSessionWriteError,
     StaleSessionWriteError,
     _is_safe_session_id,
     _json_dump,
@@ -147,6 +149,25 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- Per-SID incarnation authority. Deliberately NON-cascading (no FK, no
+-- ON DELETE CASCADE): survives delete_session() so a stale pre-delete
+-- writer cannot resurrect the transcript at generation 1.
+CREATE TABLE IF NOT EXISTS session_incarnations (
+    session_id TEXT PRIMARY KEY,
+    incarnation INTEGER NOT NULL,
+    retired INTEGER NOT NULL DEFAULT 0,
+    retired_generation INTEGER NOT NULL DEFAULT 0
+);
+
+-- Placeholder for the cleanup-lease protocol (behavior lands separately).
+CREATE TABLE IF NOT EXISTS cleanup_leases (
+    session_id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    error TEXT,
+    updated_at DOUBLE PRECISION NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 1
+);
 """
 
 
@@ -186,6 +207,13 @@ class WebUIPostgresSessionDB:
             )
             conn.execute(
                 "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS null_fields_json TEXT"
+            )
+            # Backfill the incarnation authority for pre-existing rows.
+            conn.execute(
+                "INSERT INTO session_incarnations "
+                "(session_id, incarnation, retired, retired_generation) "
+                "SELECT session_id, 1, 0, 0 FROM sessions "
+                "ON CONFLICT (session_id) DO NOTHING"
             )
             if conn.execute("SELECT 1 FROM meta WHERE key = 'created_by'").fetchone() is None:
                 has_rows = conn.execute("SELECT 1 FROM sessions LIMIT 1").fetchone() is not None
@@ -306,6 +334,7 @@ class WebUIPostgresSessionDB:
         *,
         expected_generation: int | None = None,
         force: bool = False,
+        fresh_incarnation: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(session, dict):
             raise TypeError("session must be a dict")
@@ -328,6 +357,7 @@ class WebUIPostgresSessionDB:
             self._write_session_row(
                 conn, sid, payload,
                 expected_generation=expected_generation, force=force,
+                fresh_incarnation=fresh_incarnation,
             )
             self._write_json_table(conn, "messages", "message_json", sid, messages)
             self._write_json_table(conn, "tool_calls", "tool_call_json", sid, tool_calls)
@@ -343,6 +373,7 @@ class WebUIPostgresSessionDB:
         *,
         expected_generation: int | None = None,
         force: bool = False,
+        fresh_incarnation: bool = False,
     ) -> None:
         cols = ["session_id"]
         vals: list[Any] = [sid]
@@ -376,23 +407,72 @@ class WebUIPostgresSessionDB:
         cols.append("null_fields_json")
         vals.append(_json_dump(null_fields) if null_fields else None)
 
+        # Same decision table as the SQLite store: live rows CAS on the
+        # durable generation; absent rows consult the incarnation authority.
+        # force may overwrite a LIVE row only — it never inserts an absent
+        # one; fresh_incarnation is the only lease onto a retired SID.
         row = conn.execute(
             "SELECT generation FROM sessions WHERE session_id = %s", (sid,)
         ).fetchone()
         current_generation = int(row[0] or 0) if row is not None else None
-        if current_generation is None:
-            new_generation = 1
-        elif force:
-            new_generation = current_generation + 1
-        elif expected_generation is None or int(expected_generation) != current_generation:
-            raise StaleSessionWriteError(
-                f"Refusing to overwrite session {sid!r}: expected generation "
-                f"{expected_generation!r} != persisted {current_generation!r} "
-                f"(stale writer or unloaded lineage; use force only for "
-                f"deliberate heals)"
-            )
+        if current_generation is not None:
+            if force:
+                new_generation = current_generation + 1
+            elif expected_generation is None or int(expected_generation) != current_generation:
+                raise StaleSessionWriteError(
+                    f"Refusing to overwrite session {sid!r}: expected generation "
+                    f"{expected_generation!r} != persisted {current_generation!r} "
+                    f"(stale writer or unloaded lineage; use force only for "
+                    f"deliberate heals)"
+                )
+            else:
+                new_generation = current_generation + 1
         else:
-            new_generation = current_generation + 1
+            authority = conn.execute(
+                "SELECT incarnation, retired FROM session_incarnations "
+                "WHERE session_id = %s",
+                (sid,),
+            ).fetchone()
+            if authority is None:
+                if expected_generation is not None:
+                    raise DeletedSessionWriteError(
+                        f"Refusing to write session {sid!r}: writer carries "
+                        f"generation {expected_generation!r} but no session was "
+                        f"ever persisted under this id (deleted or never existed)"
+                    )
+                conn.execute(
+                    "INSERT INTO session_incarnations "
+                    "(session_id, incarnation, retired, retired_generation) "
+                    "VALUES (%s, 1, 0, 0)",
+                    (sid,),
+                )
+                new_generation = 1
+            elif not int(authority[1]):
+                raise StaleSessionWriteError(
+                    f"Refusing to write session {sid!r}: incarnation authority "
+                    f"says the session is live but the row is absent "
+                    f"(orphaned authority; failing closed)"
+                )
+            elif expected_generation is not None:
+                raise DeletedSessionWriteError(
+                    f"Refusing to write session {sid!r}: writer carries "
+                    f"generation {expected_generation!r} from before the "
+                    f"session was deleted (stale writer after delete)"
+                )
+            elif not fresh_incarnation:
+                raise RetiredSessionWriteError(
+                    f"Refusing to recreate session {sid!r}: the id is retired "
+                    f"(deleted); only an explicit recreate with "
+                    f"fresh_incarnation=True may lease a new incarnation"
+                )
+            else:
+                conn.execute(
+                    "UPDATE session_incarnations "
+                    "SET incarnation = incarnation + 1, retired = 0 "
+                    "WHERE session_id = %s",
+                    (sid,),
+                )
+                new_generation = 1
 
         cols.append("generation")
         vals.append(new_generation)
@@ -497,11 +577,26 @@ class WebUIPostgresSessionDB:
         conn = self._conn()
         with conn:
             self._bump_revision(conn)
+            row = conn.execute(
+                "SELECT generation FROM sessions WHERE session_id = %s", (sid,)
+            ).fetchone()
+            old_generation = int(row[0] or 0) if row is not None else 0
             cur = conn.execute("DELETE FROM sessions WHERE session_id = %s", (sid,))
             conn.execute("DELETE FROM messages WHERE session_id = %s", (sid,))
             conn.execute("DELETE FROM tool_calls WHERE session_id = %s", (sid,))
             conn.execute("DELETE FROM context_messages WHERE session_id = %s", (sid,))
             conn.execute("DELETE FROM anchor_scenes WHERE session_id = %s", (sid,))
+            if cur.rowcount > 0:
+                # Retire the SID; the incarnation counter does not move on
+                # delete — only a leased recreate advances it.
+                conn.execute(
+                    "INSERT INTO session_incarnations "
+                    "(session_id, incarnation, retired, retired_generation) "
+                    "VALUES (%s, 1, 1, %s) "
+                    "ON CONFLICT (session_id) DO UPDATE SET "
+                    "retired = 1, retired_generation = EXCLUDED.retired_generation",
+                    (sid, old_generation),
+                )
         return cur.rowcount > 0
 
     def archive(self, sid: str, archived: bool = True) -> dict[str, Any]:

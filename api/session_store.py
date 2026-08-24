@@ -62,14 +62,36 @@ class SessionStore(Protocol):
         *,
         expected_generation: int | None = None,
         force: bool = False,
+        fresh_incarnation: bool = False,
     ) -> dict[str, Any]:
         """Persist a full session dict; returns the persisted representation.
 
-        SQL backends enforce a durable per-session generation CAS:
-        ``expected_generation`` must match the persisted row's generation (or
-        the row must not exist yet); ``force=True`` is reserved for deliberate
-        heals/imports. The returned dict carries the new ``generation``.
-        JSON backends accept both kwargs for parity and ignore them.
+        SQL backends enforce a durable per-session generation CAS, backed by
+        a per-SID incarnation authority (``session_incarnations``) that
+        survives ``delete_session``:
+
+        - Live row: ``expected_generation`` must match the row's generation
+          (compare-and-bump); ``force=True`` may overwrite a live row for
+          deliberate heals/imports. Anything else raises
+          ``StaleSessionWriteError``.
+        - Absent row, no authority, no lineage: first create at generation 1.
+        - Absent row with a non-None ``expected_generation``: the writer
+          carries lineage for a session that is gone —
+          ``DeletedSessionWriteError``.
+        - Absent row, retired authority, no lineage, no lease: the SID was
+          deleted; recreating it requires an explicit lease —
+          ``RetiredSessionWriteError``. ``force=True`` never inserts an
+          absent row.
+        - Absent row, retired authority, ``fresh_incarnation=True``: a
+          leased recreate — the incarnation counter advances and the new
+          row starts at generation 1. Only an explicit recreate API may
+          pass this; ``Session.save()``, delete/migration, and heal paths
+          never do. A leftover sidecar of the old incarnation is stale and
+          is unlinked only by cleanup/delete, never by recreate.
+
+        The returned dict carries the new ``generation``.
+        JSON backends accept all three kwargs for parity and ignore them
+        (last-writer-wins atomic replace).
         """
         ...
 

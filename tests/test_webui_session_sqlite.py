@@ -7,6 +7,8 @@ from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import api.models as models
 import api.webui_session_sqlite as sqlite_db
 
@@ -222,6 +224,97 @@ def test_generation_cas_refuses_stale_writers():
     # force bypasses for deliberate heals and bumps anyway.
     store.write_session(_sample_session_dict("sid-fence"), force=True)
     assert store.read_session("sid-fence")["generation"] == 3
+
+
+def test_stale_save_after_delete_is_rejected(monkeypatch):
+    """Per-SID incarnation authority: delete retires the SID durably, so a
+    Session loaded before the delete cannot resurrect the transcript by
+    saving with its pre-delete generation (previously an unconditional
+    generation-1 insert)."""
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-stale-del"))  # generation 1
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    s = models.Session.load("sid-stale-del")
+    assert s is not None
+    assert s._persisted_generation == 1
+
+    assert store.delete_session("sid-stale-del") is True
+
+    # The stale in-memory Session must be refused, not resurrect the row.
+    with pytest.raises(sqlite_db.DeletedSessionWriteError):
+        s.save()
+    assert store.session_exists("sid-stale-del") is False
+    assert store.read_session("sid-stale-del") is None
+
+    # The delete retired the SID in the durable incarnation authority.
+    row = store._conn().execute(
+        "SELECT retired, retired_generation FROM session_incarnations "
+        "WHERE session_id = ?",
+        ("sid-stale-del",),
+    ).fetchone()
+    assert row is not None
+    assert row["retired"] == 1
+    assert row["retired_generation"] == 1
+
+    # A direct write carrying pre-delete lineage is rejected the same way.
+    with pytest.raises(sqlite_db.DeletedSessionWriteError):
+        store.write_session(
+            _sample_session_dict("sid-stale-del"), expected_generation=1
+        )
+    assert store.session_exists("sid-stale-del") is False
+
+
+def test_explicit_same_id_recreation_requires_lease(monkeypatch):
+    """A deleted SID is retired: plain writes and force cannot recreate it;
+    only an explicit fresh-incarnation lease starts a new incarnation at
+    generation 1 — and a pre-delete Session stays stale across the lease."""
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-lease"))  # generation 1
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    held = models.Session.load("sid-lease")
+    assert held is not None
+    held.title = "advanced before delete"
+    held.save()  # generation 2; held._persisted_generation == 2
+
+    assert store.delete_session("sid-lease") is True
+
+    # No lease: a lineage-less recreate of a retired SID is refused.
+    with pytest.raises(sqlite_db.RetiredSessionWriteError):
+        store.write_session(_sample_session_dict("sid-lease"))
+    # force never inserts an absent row either.
+    with pytest.raises(sqlite_db.StaleSessionWriteError):
+        store.write_session(_sample_session_dict("sid-lease"), force=True)
+    assert store.session_exists("sid-lease") is False
+
+    # Leased recreate: new incarnation, row starts at generation 1.
+    store.write_session(_sample_session_dict("sid-lease"), fresh_incarnation=True)
+    loaded = store.read_session("sid-lease")
+    assert loaded is not None
+    assert loaded["generation"] == 1
+    row = store._conn().execute(
+        "SELECT incarnation, retired FROM session_incarnations WHERE session_id = ?",
+        ("sid-lease",),
+    ).fetchone()
+    assert row["incarnation"] == 2
+    assert row["retired"] == 0
+
+    # A still-held pre-delete Session remains a stale writer across the lease.
+    held.title = "stale pre-delete write"
+    with pytest.raises(sqlite_db.StaleSessionWriteError):
+        held.save()
+    assert store.read_session("sid-lease")["title"] == "Test Session"
 
 
 def test_two_readers_stale_writer_is_rejected(monkeypatch):

@@ -54,7 +54,7 @@ def _pg_store():
     conn = store._conn()
     with conn:
         conn.execute(
-            "TRUNCATE sessions, messages, tool_calls, context_messages, anchor_scenes"
+            "TRUNCATE sessions, messages, tool_calls, context_messages, anchor_scenes, session_incarnations"
         )
     return store
 
@@ -210,7 +210,7 @@ def test_session_model_runs_on_postgres_backend(monkeypatch, tmp_path):
     conn = store._conn()
     with conn:
         conn.execute(
-            "TRUNCATE sessions, messages, tool_calls, context_messages, anchor_scenes"
+            "TRUNCATE sessions, messages, tool_calls, context_messages, anchor_scenes, session_incarnations"
         )
     monkeypatch.setattr(models, "_pg_session_store_instance", store)
     monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
