@@ -180,6 +180,137 @@ def test_generation_cas(sql_store):
     assert sql_store.read_session("c9")["generation"] == 3
 
 
+def test_update_metadata_advances_generation(sql_store):
+    """Metadata-only writers move the same version fence as full writes."""
+    sql_store.write_session(_sample("g1"))  # generation 1
+    assert sql_store.read_session("g1")["generation"] == 1
+    meta = sql_store.update_metadata("g1", {"composer_draft": {"text": "x", "files": []}})
+    assert meta["generation"] == 2
+    row = sql_store.read_session("g1")
+    assert row["generation"] == 2
+    # Row content otherwise preserved.
+    assert row["title"] == "Contract Session"
+    assert len(row["messages"]) == 2
+    assert row["tool_calls"][0]["name"] == "fs.read"
+
+
+def test_update_metadata_rejects_generation_field(sql_store):
+    """A metadata writer must never forge the version fence."""
+    sql_store.write_session(_sample("g2"))
+    with pytest.raises(ValueError):
+        sql_store.update_metadata("g2", {"generation": 9})
+    assert sql_store.read_session("g2")["generation"] == 1
+
+
+def test_read_row_version_sql(sql_store):
+    """Durable (generation, incarnation) of the live row, or None."""
+    assert sql_store.read_row_version("rv1") is None  # absent
+    sql_store.write_session(_sample("rv1"))
+    assert sql_store.read_row_version("rv1") == {"generation": 1, "incarnation": 1}
+    sql_store.update_metadata("rv1", {"title": "renamed"})
+    assert sql_store.read_row_version("rv1") == {"generation": 2, "incarnation": 1}
+    sql_store.delete_session("rv1")
+    assert sql_store.read_row_version("rv1") is None  # retired
+    sql_store.write_session(_sample("rv1"), fresh_incarnation=True)
+    assert sql_store.read_row_version("rv1") == {"generation": 1, "incarnation": 2}
+    # Path-unsafe ids are refused, not queried.
+    assert sql_store.read_row_version("../escape") is None
+
+
+def test_reconcile_marked_write_overlays_only_given_fields(sql_store):
+    """The atomic reconcile applies ONLY the given fields, bumps the fence,
+    and returns the authoritative full row for caller rehydration."""
+    payload = _sample("rc1")
+    payload["pinned"] = True
+    sql_store.write_session(payload)  # generation 1, incarnation 1
+    row = sql_store.reconcile_marked_write(
+        "rc1",
+        expected_generation=1,
+        expected_incarnation=1,
+        fields={"title": "overlaid", "updated_at": 2000.0},
+    )
+    assert row is not None
+    assert row["title"] == "overlaid"
+    assert row["pinned"] is True  # row's own value survived
+    assert row["generation"] == 2
+    # Full-row shape: transcript children included for rehydration.
+    assert len(row["messages"]) == 2
+    assert row["tool_calls"][0]["name"] == "fs.read"
+    assert row["context_messages"][0]["content"] == "ctx"
+    # Unknown keys ride extra_json, same policy as update_metadata.
+    row2 = sql_store.reconcile_marked_write(
+        "rc1",
+        expected_generation=2,
+        expected_incarnation=1,
+        fields={"future_flag": {"on": True}},
+    )
+    assert row2["future_flag"] == {"on": True}
+    assert row2["generation"] == 3
+
+
+def test_reconcile_marked_write_fails_closed_on_version_mismatch(sql_store):
+    """Any durable-version mismatch refuses with None and writes nothing."""
+    sql_store.write_session(_sample("rc2"))  # generation 1, incarnation 1
+    # Wrong generation.
+    assert sql_store.reconcile_marked_write(
+        "rc2", expected_generation=7, expected_incarnation=1,
+        fields={"title": "x"},
+    ) is None
+    # Wrong incarnation.
+    assert sql_store.reconcile_marked_write(
+        "rc2", expected_generation=1, expected_incarnation=9,
+        fields={"title": "x"},
+    ) is None
+    # Absent row.
+    assert sql_store.reconcile_marked_write(
+        "rc-missing", expected_generation=1, expected_incarnation=1,
+        fields={"title": "x"},
+    ) is None
+    # Nothing was modified by the refusals.
+    row = sql_store.read_session("rc2")
+    assert row["title"] == "Contract Session"
+    assert row["generation"] == 1
+    # Retired row (deleted): fail closed even with the pre-delete version.
+    sql_store.delete_session("rc2")
+    assert sql_store.reconcile_marked_write(
+        "rc2", expected_generation=1, expected_incarnation=1,
+        fields={"title": "x"},
+    ) is None
+    # Path-unsafe ids are refused, not queried.
+    assert sql_store.reconcile_marked_write(
+        "../escape", expected_generation=1, expected_incarnation=1,
+        fields={"title": "x"},
+    ) is None
+
+
+def test_reconcile_marked_write_rejects_unsafe_fields(sql_store):
+    """Same unsafe-field guard as update_metadata, plus the fence itself."""
+    sql_store.write_session(_sample("rc3"))
+    for bad in ({"generation": 5}, {"messages": []}, {"session_id": "y"},
+                {"tool_calls": []}, {"message_count": 0}):
+        with pytest.raises(ValueError):
+            sql_store.reconcile_marked_write(
+                "rc3", expected_generation=1, expected_incarnation=1, fields=bad
+            )
+    assert sql_store.read_session("rc3")["generation"] == 1
+
+
+def test_reconcile_contract_inert_without_generation_capability(store):
+    """JSON backend: no durable version, no reconcile — both methods are
+    inert None (the contract is SQL-only; production gates the reconcile on
+    supports_generation)."""
+    if store.supports_generation:
+        pytest.skip("SQL backends are covered by the sql_store reconcile tests")
+    store.write_session(_sample("jr1"))
+    assert store.read_row_version("jr1") is None
+    assert store.reconcile_marked_write(
+        "jr1", expected_generation=1, expected_incarnation=1,
+        fields={"title": "x"},
+    ) is None
+    # Inert means inert: the write did not land.
+    assert store.read_session("jr1")["title"] == "Contract Session"
+
+
 def test_null_key_presence(sql_store):
     """Explicitly-None fields read back as present None (JSON parity)."""
     payload = _sample("c10")

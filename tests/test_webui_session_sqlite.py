@@ -723,7 +723,10 @@ def test_recovery_demotes_mark_and_carries_draft(monkeypatch):
     assert sid not in store.unreadable_sids
     assert s2.composer_draft["text"] == "typed during outage"
     assert store.read_metadata_only(sid)["composer_draft"]["text"] == "typed during outage"
-    assert s2._persisted_generation == 1
+    # The demote's draft carry is a metadata write, and metadata writers move
+    # the generation fence (1 -> 2); the demoted load is constructed at the
+    # current generation so its own saves still pass the CAS.
+    assert s2._persisted_generation == 2
 
     # The stale sidecar-loaded object is now a stale reader: refused loudly
     # instead of rolling the recovered row back.
@@ -918,6 +921,320 @@ def test_marked_recovered_save_reconciles_metadata_only(monkeypatch):
     assert row["generation"] == 2
     assert [m["content"] for m in row["messages"]] == ["hello", "hi"]
     assert s._persisted_generation == 2
+
+    # Rehydration: the in-memory owner adopted the authoritative row —
+    # transcript children, scenes, and the post-bump generation — so a
+    # second save() is a clean plain-CAS write, not another reconcile.
+    assert s.messages == row["messages"]
+    assert s.tool_calls == row["tool_calls"]
+    assert s.context_messages == row["context_messages"]
+    assert s.anchor_activity_scenes == row["anchor_activity_scenes"]
+    s.save()
+    row2 = store.read_session(sid)
+    assert row2["generation"] == 3
+    assert row2["title"] == "edited while marked"
+    assert [m["content"] for m in row2["messages"]] == ["hello", "hi"]
+
+
+def test_marked_reconcile_overlays_only_proven_dirty_metadata(monkeypatch):
+    """Finding 1: transcript equality is not metadata authorization.
+
+    A stale sidecar (predating SQL-side metadata edits) that loads during an
+    outage must have only its PROVEN-dirty fields overlaid onto the recovered
+    row — the row's newer pinned/workspace/token metadata must survive.
+    On the parent tree the reconcile writes the entire flattened sidecar
+    payload over the row, rolling pinned/workspace/input_tokens back.
+    """
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+
+    sid = "sid-dirty-overlay"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    # SQL row at generation 1 with NEWER metadata (post-sidecar edits).
+    row_payload = _sample_session_dict(sid)
+    row_payload.update(
+        {"pinned": True, "workspace": "/sql", "input_tokens": 1234}
+    )
+    store.write_session(row_payload)
+    # Stale sidecar: same transcript, same (stale) token counter, but the
+    # older pinned=False / workspace="/json" / title.
+    sidecar_payload = _sample_session_dict(sid)
+    sidecar_payload.update(
+        {
+            "pinned": False,
+            "workspace": "/json",
+            "title": "sidecar title",
+            "input_tokens": 1000,
+        }
+    )
+    (d / f"{sid}.json").write_text(json.dumps(sidecar_payload), encoding="utf-8")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    s = models.Session.load(sid)
+    assert s is not None
+    assert sid in store.unreadable_sids
+
+    s.title = "edited while marked"
+    s.save()
+
+    # Only the proven-dirty fields (title, updated_at) were overlaid: the
+    # row's newer SQL-side metadata survived the reconcile.
+    assert sid not in store.unreadable_sids
+    row = store.read_session(sid)
+    assert row["title"] == "edited while marked"
+    assert row["pinned"] is True
+    assert row["workspace"] == "/sql"
+    assert row["input_tokens"] == 1234
+    assert row["generation"] == 2
+    assert s._persisted_generation == 2
+
+
+def test_marked_reconcile_fenced_against_concurrent_update_metadata(monkeypatch):
+    """Finding 4: metadata-only writers move the version fence.
+
+    A metadata write landing between the reconcile probe and the reconcile
+    write must invalidate the reconcile: on the parent tree update_metadata
+    leaves the generation untouched, so the probe-reseated CAS passes and
+    the sidecar payload silently rolls the metadata write back.
+    """
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+
+    sid = "sid-meta-fence"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))
+    (d / f"{sid}.json").write_text(
+        json.dumps(_sample_session_dict(sid)), encoding="utf-8"
+    )
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    s = models.Session.load(sid)
+    assert s is not None
+    assert sid in store.unreadable_sids
+
+    # Inject a concurrent metadata write between save()'s probe and the
+    # reconcile: the probe reads the row, THEN the row's generation moves.
+    injected = {"done": False}
+
+    def inject_concurrent_write(sid_):
+        row = real_read(sid_)
+        if row is not None and not injected["done"]:
+            injected["done"] = True
+            store.update_metadata(sid_, {"pinned": True})
+        return row
+
+    monkeypatch.setattr(store, "read_session", inject_concurrent_write)
+
+    s.title = "edited"
+    with pytest.raises(sqlite_db.StaleSessionWriteError):
+        s.save()
+
+    # The concurrent metadata write survived; the stale sidecar metadata
+    # was NOT laundered over it; the mark is retained for self-healing.
+    row = store.read_session(sid)
+    assert row["pinned"] is True
+    assert row["title"] == "Test Session"
+    assert sid in store.unreadable_sids
+
+
+def test_marked_reconcile_fails_closed_across_incarnation_recreate(monkeypatch):
+    """Finding 2: generation equality is not enough — the incarnation
+    authority is the sole discriminator for delete + same-SID recreate.
+
+    The recreated row starts again at generation 1 with an equal transcript,
+    so on the parent tree the generation CAS passes and the stale marked
+    owner's write lands on the NEW incarnation. The store-owned reconcile
+    validates session_incarnations and refuses.
+    """
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+
+    sid = "sid-incarnation"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    # Row at generation 1, incarnation 1, transcript T; sidecar same T.
+    store.write_session(_sample_session_dict(sid))
+    (d / f"{sid}.json").write_text(
+        json.dumps(_sample_session_dict(sid)), encoding="utf-8"
+    )
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    # Mark with baseline (generation 1, incarnation 1).
+    s = models.Session.load(sid)
+    assert s is not None
+    assert sid in store.unreadable_sids
+
+    # Delete + explicit same-SID recreate: live row is generation 1 again
+    # (the generation check passes — 1 == 1) but incarnation 2.
+    assert store.delete_session(sid) is True
+    recreated = _sample_session_dict(sid)
+    recreated["title"] = "recreated title"
+    store.write_session(recreated, fresh_incarnation=True)
+
+    # The stale marked owner's save must fail closed: the incarnation check
+    # is the ONLY discriminator here.
+    s.title = "stale owner edit"
+    with pytest.raises(sqlite_db.StaleSessionWriteError):
+        s.save()
+
+    row = store.read_session(sid)
+    assert row["title"] == "recreated title"
+    assert sid in store.unreadable_sids
+
+    # The next load demotes the mark and returns the recreated row.
+    s2 = models.Session.load(sid)
+    assert s2 is not None
+    assert sid not in store.unreadable_sids
+    assert s2.title == "recreated title"
+
+
+def test_marked_reconcile_rehydrates_owner_children_for_second_save(monkeypatch):
+    """Finding 3: the reconcile must rehydrate the in-memory owner.
+
+    On the parent tree the child-swap patched only the write payload, so the
+    owner's stale sidecar children (here: anchor_activity_scenes) were written
+    back over the row by the SECOND save(). With store-owned reconcile +
+    rehydration the owner adopts the row's children atomically.
+    """
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+
+    sid = "sid-rehydrate"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    row_payload = _sample_session_dict(sid)
+    row_payload.update(
+        {
+            "tool_calls": [{"name": "fs.read", "args": {"path": "/x"}}],
+            "context_messages": [{"role": "system", "content": "ctx"}],
+            "anchor_activity_scenes": {"scene-1": {"updated_at": 1.0, "body": "live"}},
+        }
+    )
+    store.write_session(row_payload)
+    # Sidecar: equal messages/tool_calls/context_messages, but STALE scenes.
+    sidecar_payload = _sample_session_dict(sid)
+    sidecar_payload.update(
+        {
+            "tool_calls": [{"name": "fs.read", "args": {"path": "/x"}}],
+            "context_messages": [{"role": "system", "content": "ctx"}],
+            "anchor_activity_scenes": {"scene-old": {"updated_at": 0.5, "body": "stale"}},
+        }
+    )
+    (d / f"{sid}.json").write_text(json.dumps(sidecar_payload), encoding="utf-8")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    s = models.Session.load(sid)
+    assert s is not None
+    assert sid in store.unreadable_sids
+    assert set(s.anchor_activity_scenes) == {"scene-old"}  # sidecar authority while marked
+
+    s.title = "edited"
+    s.save()  # reconcile: store owns the children; the owner rehydrates
+
+    # The owner adopted the row's children and the post-bump generation.
+    assert sid not in store.unreadable_sids
+    assert set(s.anchor_activity_scenes) == {"scene-1"}
+    assert s.tool_calls == [{"name": "fs.read", "args": {"path": "/x"}}]
+    assert s.context_messages == [{"role": "system", "content": "ctx"}]
+    assert [m["content"] for m in s.messages] == ["hello", "hi"]
+    assert s._persisted_generation == 2
+
+    # The second save is a clean plain-CAS write and must NOT write the
+    # sidecar's stale scenes back over the row.
+    s.save()
+    row = store.read_session(sid)
+    assert set(row["anchor_activity_scenes"]) == {"scene-1"}
+    assert row["generation"] == 3
+    assert row["title"] == "edited"
+    assert [m["content"] for m in row["messages"]] == ["hello", "hi"]
+    assert row["tool_calls"] == [{"name": "fs.read", "args": {"path": "/x"}}]
+
+
+def test_save_metadata_reseats_generation_for_subsequent_save(monkeypatch):
+    """Fence blast-radius mitigation: the WebUI's single cached object per
+    sid performs both the draft autosave and the later full save();
+    save_metadata must reseat _persisted_generation from the bumped row so
+    the full save still passes the CAS and the draft survives it."""
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+
+    sid = "sid-reseat"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict(sid))  # generation 1
+    store.update_metadata(sid, {"title": "t2"})     # generation 2
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    s = models.Session.load(sid)
+    assert s is not None
+    assert s._persisted_generation == 2
+
+    s.save_metadata({"composer_draft": {"text": "d", "files": []}})
+    assert store.read_metadata_only(sid)["generation"] == 3
+    assert s._persisted_generation == 3
+
+    # The subsequent full save must not raise StaleSessionWriteError, and
+    # the draft written by the metadata path survives it.
+    s.title = "t3"
+    s.save()
+    row = store.read_session(sid)
+    assert row["title"] == "t3"
+    assert row["composer_draft"]["text"] == "d"
+    assert row["generation"] == 4
 
 
 def test_marked_recovered_save_fails_closed_on_divergent_transcript(monkeypatch):

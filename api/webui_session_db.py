@@ -155,6 +155,23 @@ class WebUIJsonSessionDB:
         """Set the archived metadata flag without touching transcript messages."""
         return self.update_metadata(sid, {"archived": bool(archived)})
 
+    def read_row_version(self, sid: str) -> None:
+        """No durable version exists on the JSON backend (last-writer-wins)."""
+        return None
+
+    def reconcile_marked_write(
+        self,
+        sid: str,
+        *,
+        expected_generation: int,
+        expected_incarnation: int,
+        fields: dict[str, Any],
+    ) -> None:
+        """Inert: the atomic reconcile contract is SQL-only. Unreachable in
+        production — Session.save() gates the reconcile on
+        ``supports_generation``."""
+        return None
+
     def read_metadata_only(self, sid: str) -> dict[str, Any] | None:
         """Metadata-only view of the sidecar (canonical-store contract)."""
         data = self.read_session(sid)

@@ -357,8 +357,11 @@ class WebUISqliteSessionDB:
         self._created_by = created_by
         self._local = threading.local()
         # Per-store failure state: sids whose row failed to read and whose
-        # sidecar became authoritative (sid -> sidecar draft at mark time).
-        self.unreadable_sids: dict[str, object] = {}
+        # sidecar became authoritative. Each mark entry is a dict:
+        # {"composer_draft": sidecar draft at mark time, "baseline_meta":
+        # deep-copied metadata snapshot, "baseline_generation": int | None,
+        # "baseline_incarnation": int | None} (see api.models Session.load).
+        self.unreadable_sids: dict[str, dict] = {}
         self._ensure_schema()
 
     @property
@@ -636,77 +639,171 @@ class WebUISqliteSessionDB:
             self._write_anchor_scenes(conn, sid, payload.get("anchor_activity_scenes", {}))
         return self.read_session(sid) or {}
 
+    _METADATA_UNSAFE_FIELDS = frozenset(
+        {"session_id", "messages", "tool_calls", "message_count", "generation"}
+    )
+
+    def _apply_metadata_fields(
+        self, conn: sqlite3.Connection, sid: str, fields: dict[str, Any]
+    ) -> tuple[list[str], list[Any]]:
+        """Build (set_parts, values) for a targeted metadata UPDATE.
+
+        Handles _SESSION_JSON_FIELDS/_SESSION_SCALAR_FIELDS classification,
+        extra_json merge, null_fields_json maintenance, and explicit
+        updated_at. Does NOT append the sid placeholder or the generation
+        bump — callers own the version fence and the WHERE clause.
+        """
+        set_parts: list[str] = []
+        values: list[Any] = []
+        extras: dict[str, Any] = {}
+        for k, v in fields.items():
+            if k in _SESSION_JSON_FIELDS:
+                set_parts.append(f"{k} = ?")
+                values.append(None if v is None else _json_dump(v))
+            elif k in _SESSION_SCALAR_FIELDS:
+                set_parts.append(f"{k} = ?")
+                values.append(v)
+            else:
+                # Unknown/forward-compatible keys ride in extra_json.
+                extras[k] = v
+        if extras:
+            row = conn.execute(
+                "SELECT extra_json FROM sessions WHERE session_id = ?", (sid,)
+            ).fetchone()
+            current: dict[str, Any] = {}
+            if row is not None and row["extra_json"]:
+                try:
+                    parsed = json.loads(row["extra_json"])
+                    if isinstance(parsed, dict):
+                        current = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            current.update(extras)
+            set_parts.append("extra_json = ?")
+            values.append(_json_dump(current))
+        # Maintain null key-presence across targeted updates.
+        nrow = conn.execute(
+            "SELECT null_fields_json FROM sessions WHERE session_id = ?", (sid,)
+        ).fetchone()
+        null_fields: list[str] = []
+        if nrow is not None and nrow["null_fields_json"]:
+            try:
+                parsed = json.loads(nrow["null_fields_json"])
+                if isinstance(parsed, list):
+                    null_fields = [x for x in parsed if isinstance(x, str)]
+            except (json.JSONDecodeError, TypeError):
+                pass
+        for k, v in fields.items():
+            if v is None:
+                if k not in null_fields:
+                    null_fields.append(k)
+            elif k in null_fields:
+                null_fields.remove(k)
+        set_parts.append("null_fields_json = ?")
+        values.append(_json_dump(null_fields) if null_fields else None)
+        # Only bump updated_at when the caller explicitly provides it.
+        # Draft autosave calls save_metadata() without updated_at so that
+        # typing does not reorder the session in the sidebar or trigger
+        # activity-poll reloads.
+        if "updated_at" in fields:
+            set_parts.append("updated_at = ?")
+            values.append(fields["updated_at"])
+        return set_parts, values
+
     def update_metadata(self, sid: str, fields: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(fields, dict):
             raise TypeError("fields must be a dict")
-        unsafe = set(fields) & {"session_id", "messages", "tool_calls", "message_count"}
+        unsafe = set(fields) & self._METADATA_UNSAFE_FIELDS
         if unsafe:
             raise ValueError(f"Unsafe session metadata fields: {', '.join(sorted(unsafe))}")
 
         conn = self._conn()
         with conn:
             self._bump_revision(conn)
-            set_parts: list[str] = []
-            values: list[Any] = []
-            extras: dict[str, Any] = {}
-            for k, v in fields.items():
-                if k in _SESSION_JSON_FIELDS:
-                    set_parts.append(f"{k} = ?")
-                    values.append(None if v is None else _json_dump(v))
-                elif k in _SESSION_SCALAR_FIELDS:
-                    set_parts.append(f"{k} = ?")
-                    values.append(v)
-                else:
-                    # Unknown/forward-compatible keys ride in extra_json.
-                    extras[k] = v
-            if extras:
-                row = conn.execute(
-                    "SELECT extra_json FROM sessions WHERE session_id = ?", (sid,)
-                ).fetchone()
-                current: dict[str, Any] = {}
-                if row is not None and row["extra_json"]:
-                    try:
-                        parsed = json.loads(row["extra_json"])
-                        if isinstance(parsed, dict):
-                            current = parsed
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                current.update(extras)
-                set_parts.append("extra_json = ?")
-                values.append(_json_dump(current))
-            # Maintain null key-presence across targeted updates.
-            nrow = conn.execute(
-                "SELECT null_fields_json FROM sessions WHERE session_id = ?", (sid,)
-            ).fetchone()
-            null_fields: list[str] = []
-            if nrow is not None and nrow["null_fields_json"]:
-                try:
-                    parsed = json.loads(nrow["null_fields_json"])
-                    if isinstance(parsed, list):
-                        null_fields = [x for x in parsed if isinstance(x, str)]
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            for k, v in fields.items():
-                if v is None:
-                    if k not in null_fields:
-                        null_fields.append(k)
-                elif k in null_fields:
-                    null_fields.remove(k)
-            set_parts.append("null_fields_json = ?")
-            values.append(_json_dump(null_fields) if null_fields else None)
-            # Only bump updated_at when the caller explicitly provides it.
-            # Draft autosave calls save_metadata() without updated_at so that
-            # typing does not reorder the session in the sidebar or trigger
-            # activity-poll reloads.
-            if "updated_at" in fields:
-                set_parts.append("updated_at = ?")
-                values.append(fields["updated_at"])
+            set_parts, values = self._apply_metadata_fields(conn, sid, fields)
+            # Metadata-only writers move the same version fence as full
+            # writes, so a concurrent full-save CAS can never silently roll
+            # a metadata write back.
+            set_parts.append("generation = generation + 1")
             values.append(sid)
             conn.execute(
                 f"UPDATE sessions SET {', '.join(set_parts)} WHERE session_id = ?",
                 values,
             )
         return self._metadata_row(sid)
+
+    def read_row_version(self, sid: str) -> dict[str, int] | None:
+        """Durable (generation, incarnation) of the live row (contract).
+
+        One indexed JOIN against the incarnation authority; read-only.
+        Returns None for an absent or retired row.
+        """
+        if not _is_safe_session_id(sid):
+            return None
+        row = self._conn().execute(
+            "SELECT s.generation AS generation, i.incarnation AS incarnation, "
+            "i.retired AS retired "
+            "FROM sessions s JOIN session_incarnations i "
+            "ON i.session_id = s.session_id "
+            "WHERE s.session_id = ?",
+            (sid,),
+        ).fetchone()
+        if row is None or int(row["retired"]):
+            return None
+        return {
+            "generation": int(row["generation"] or 0),
+            "incarnation": int(row["incarnation"]),
+        }
+
+    def reconcile_marked_write(
+        self,
+        sid: str,
+        *,
+        expected_generation: int,
+        expected_incarnation: int,
+        fields: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Atomically overlay proven-dirty metadata onto a recovered row whose
+        durable version still matches the fallback-load baseline. Fail closed
+        (None, nothing written) on any generation/incarnation mismatch."""
+        if not _is_safe_session_id(sid):
+            return None
+        if not isinstance(fields, dict):
+            raise TypeError("fields must be a dict")
+        unsafe = set(fields) & self._METADATA_UNSAFE_FIELDS
+        if unsafe:
+            raise ValueError(f"Unsafe session metadata fields: {', '.join(sorted(unsafe))}")
+
+        conn = self._conn()
+        with conn:
+            row = conn.execute(
+                "SELECT generation FROM sessions WHERE session_id = ?", (sid,)
+            ).fetchone()
+            authority = conn.execute(
+                "SELECT incarnation, retired FROM session_incarnations "
+                "WHERE session_id = ?",
+                (sid,),
+            ).fetchone()
+            if (
+                row is None
+                or authority is None
+                or int(authority["retired"])
+                or int(authority["incarnation"]) != int(expected_incarnation)
+                or int(row["generation"] or 0) != int(expected_generation)
+            ):
+                return None  # fail closed; nothing written
+            self._bump_revision(conn)
+            set_parts, values = self._apply_metadata_fields(conn, sid, fields)
+            set_parts.append("generation = generation + 1")
+            values.extend([sid, int(expected_generation)])
+            cur = conn.execute(
+                f"UPDATE sessions SET {', '.join(set_parts)} "
+                "WHERE session_id = ? AND generation = ?",
+                values,
+            )
+            if cur.rowcount != 1:
+                return None  # CAS belt-and-braces inside the txn
+        return self.read_session(sid)
 
     def delete_session(self, sid: str) -> bool:
         """Remove a session and all its rows. Returns True if a row existed.

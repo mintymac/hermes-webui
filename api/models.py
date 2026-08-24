@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover
     _msvcrt = None
 
 import api.config as _cfg
-from api.webui_session_sqlite import WebUISqliteSessionDB
+from api.webui_session_sqlite import StaleSessionWriteError, WebUISqliteSessionDB
 from api.compression_anchor import is_context_compression_marker
 from api.config import (
     SESSION_DIR, SESSION_INDEX_FILE, SESSIONS, SESSIONS_MAX,
@@ -1253,15 +1253,28 @@ _sqlite_session_store_instance = None
 _sqlite_session_store_stamp = None
 
 # Sids whose SQLite row failed to read (corrupt payload, DB read error),
-# mapped to the sidecar's composer_draft at the moment the fallback load
-# succeeded. While a sid is marked, its JSON sidecar is authoritative for
+# mapped to a rich mark entry captured at the moment the fallback load
+# succeeded:
+#   {
+#     "composer_draft":       sidecar draft at mark time (demote carry),
+#     "baseline_meta":        deep-copied sidecar metadata snapshot (the
+#                             dirty-diff base for the store-owned reconcile),
+#     "baseline_generation":  durable row generation at mark time, or None
+#                             when the header read also failed (fail closed),
+#     "baseline_incarnation": durable incarnation at mark time, or None,
+#   }
+# While a sid is marked, its JSON sidecar is authoritative for
 # BOTH reads (Session.load / load_metadata_only) and metadata writes
 # (save_metadata) — keeping one store on both sides is what prevents
 # drafts saved during the outage from disappearing behind a flip back to
 # SQLite. The mark clears via demote-on-recovery: when a probe of the row
 # reads healthy again, _demote_marked_if_recovered carries any sidecar
 # draft written during the outage into the row and pops the mark. A full
-# save() alone no longer heals the row (removed in blocker 2).
+# save() alone no longer heals the row (removed in blocker 2); a marked
+# save() onto a recovered row goes through the store-owned
+# reconcile_marked_write contract, which validates the durable
+# generation+incarnation against the baseline before overlaying only the
+# proven-dirty metadata fields.
 
 # Per-sid process-local locks serializing unreadable-mark transitions (the
 # mark-set in Session.load's fallback, the mark-pop in Session.save's SQL
@@ -1290,6 +1303,48 @@ def _draft_demote_lock_for_sid(sid: str) -> threading.Lock:
         return lock
 
 
+def _canon(value):
+    """Canonical JSON form for transcript/metadata comparisons — the same
+    shape as scripts/migrate_sessions_to_sqlite.py::_canon."""
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+# Keys never eligible for the marked-save reconcile overlay: identity,
+# transcript children, store-computed values, and the version fence itself.
+_RECONCILE_BASELINE_EXCLUDED_KEYS = {
+    "session_id", "messages", "tool_calls", "context_messages",
+    "anchor_activity_scenes",           # transcript-derived; never a metadata overlay axis
+    "anchor_scene_index", "anchor_scene_index_hash",  # computed at write time
+    "message_count", "last_message_at",                # computed
+    "generation",                        # owned by the store fence, never by metadata
+}
+
+
+def _reconcile_dirty_fields(payload: dict, baseline_meta: dict) -> dict:
+    """Fields proven dirty = in-memory save() payload vs the fallback-load
+    baseline snapshot, under the canonical JSON form. Only these are overlaid
+    onto the recovered row; everything else keeps the row's own value."""
+    _MISSING = object()
+    dirty = {}
+    for k in set(payload) | set(baseline_meta):
+        if k in _RECONCILE_BASELINE_EXCLUDED_KEYS:
+            continue
+        cur, base = payload.get(k, _MISSING), baseline_meta.get(k, _MISSING)
+        if cur is _MISSING and base is _MISSING:
+            continue
+        if cur is _MISSING:
+            dirty[k] = None                      # dropped in memory → null it out
+        elif base is _MISSING or _canon(cur) != _canon(base):
+            dirty[k] = cur
+    return dirty
+
+
 def _demote_marked_if_recovered(store, sid: str):
     """Probe a marked sid's row; on full-read success, carry any
     marked-window sidecar draft into the row, pop the mark, and return the
@@ -1316,13 +1371,21 @@ def _demote_marked_if_recovered(store, sid: str):
             # row's (a post-recovery save_metadata already routes to SQL).
             return data
         at_mark = store.unreadable_sids.get(sid)
+        # The entry is always the rich mark dict — marks are process-local
+        # and never persist across the schema that created them.
+        at_mark_draft = at_mark.get("composer_draft")
         try:
             sc = SESSION_DIR / f'{sid}.json'
             if sc.exists():
                 live = json.loads(sc.read_text(encoding='utf-8')).get('composer_draft')
-                if live != at_mark:
-                    store.update_metadata(sid, {"composer_draft": live})
+                if live != at_mark_draft:
+                    _carry = store.update_metadata(sid, {"composer_draft": live})
                     data['composer_draft'] = live
+                    # The carry bumps the generation fence (metadata writers
+                    # move it too): refresh the probe so the demoted load
+                    # constructs the session at the current generation.
+                    if isinstance(_carry, dict) and _carry.get("generation") is not None:
+                        data["generation"] = _carry["generation"]
         except Exception:
             logger.debug("Failed to carry fallback draft for %s", sid, exc_info=True)
             return None
@@ -1696,7 +1759,12 @@ class Session:
                 # actually persisted — otherwise the draft route's unchanged
                 # fast path sees the requested value already in memory and skips
                 # the retry, losing the draft after the next reload.
-                store.update_metadata(self.session_id, fields)
+                _result = store.update_metadata(self.session_id, fields)
+                # update_metadata moves the generation fence: reseat the
+                # persisted lineage from the returned row so this (cached,
+                # per-sid) object's next full save() still passes the CAS.
+                if isinstance(_result, dict) and _result.get("generation") is not None:
+                    self._persisted_generation = int(_result["generation"])
                 for k, v in fields.items():
                     setattr(self, k, v)
                 return
@@ -1782,57 +1850,92 @@ class Session:
                     # _persisted_generation=None, so the plain CAS write below
                     # would deterministically refuse (StaleSessionWriteError)
                     # and the user's mutation could never persist ("recovered
-                    # saves always fail CAS"). Reconcile on the transcript —
-                    # messages / tool_calls / context_messages
-                    # (anchor_activity_scenes is transcript-derived, never a
-                    # rollback axis) — comparing both sides after the load-time
-                    # partial-collapse normalization, under the same canonical
-                    # JSON form as scripts/migrate_sessions_to_sqlite.py::_canon.
-                    # Transcript identical (metadata-only deltas): reseat the
-                    # CAS generation from the probe and write the in-memory
-                    # metadata over the row's OWN children — SQL children are
-                    # never rolled back. Transcript diverged: no reconcile, so
-                    # the write below raises StaleSessionWriteError exactly as
-                    # before (fail closed; a divergent transcript is never
-                    # silently dropped).
-                    def _canon_transcript(value):
-                        return json.dumps(
-                            value,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                            default=str,
-                        )
-
+                    # saves always fail CAS"). The store-owned reconcile
+                    # authorizes the overlay instead: the transcript gate
+                    # (messages / tool_calls / context_messages under the
+                    # load-time partial-collapse normalization and the
+                    # canonical JSON form) proves the in-memory owner is not
+                    # transcript-stale, the fallback-load baseline gates the
+                    # durable version, and reconcile_marked_write validates
+                    # generation+incarnation and overlays ONLY the
+                    # proven-dirty metadata fields in one transaction — the
+                    # row's own metadata and transcript children are never
+                    # rolled back. Any refusal fails closed: either the store
+                    # rejects the version (StaleSessionWriteError, mark
+                    # retained) or the gates fall through to the plain CAS
+                    # write below, which raises for a sidecar-loaded owner.
+                    _entry = store.unreadable_sids.get(self.session_id)
+                    _entry = _entry if isinstance(_entry, dict) else {}
+                    _baseline_meta = _entry.get("baseline_meta")
+                    _base_gen = _entry.get("baseline_generation")
+                    _base_inc = _entry.get("baseline_incarnation")
+                    # Gate 1: transcript equality under load-time
+                    # partial-collapse normalization. messages/tool_calls/
+                    # context_messages only — anchor_activity_scenes is
+                    # transcript-derived and store-owned on this path.
                     _payload_messages, _ = _collapse_adjacent_duplicate_partials(
                         payload.get("messages")
                     )
                     _probe_messages, _ = _collapse_adjacent_duplicate_partials(
                         _probe.get("messages")
                     )
-                    if (
-                        _canon_transcript(_payload_messages)
-                        == _canon_transcript(_probe_messages)
-                        and _canon_transcript(payload.get("tool_calls"))
-                        == _canon_transcript(_probe.get("tool_calls"))
-                        and _canon_transcript(payload.get("context_messages"))
-                        == _canon_transcript(_probe.get("context_messages"))
-                    ):
-                        # Metadata-only delta: keep the in-memory metadata
-                        # (title, workspace, pinned, composer_draft, … — the
-                        # user's current edits, which are the point of the
-                        # fix), but let the recovered row's transcript
-                        # children win the write, and reseat the generation
-                        # so the CAS passes.
-                        payload["messages"] = _probe.get("messages") or []
-                        payload["tool_calls"] = _probe.get("tool_calls") or []
-                        payload["context_messages"] = (
-                            _probe.get("context_messages") or []
-                        )
-                        payload["anchor_activity_scenes"] = (
-                            _probe.get("anchor_activity_scenes") or {}
-                        )
-                        self._persisted_generation = _probe.get("generation")
+                    _transcripts_equal = (
+                        _canon(_payload_messages)
+                        == _canon(_probe_messages)
+                        and _canon(payload.get("tool_calls"))
+                        == _canon(_probe.get("tool_calls"))
+                        and _canon(payload.get("context_messages"))
+                        == _canon(_probe.get("context_messages"))
+                    )
+                    if (not isinstance(_baseline_meta, dict) or _base_gen is None
+                            or _base_inc is None or not _transcripts_equal):
+                        # Fail closed: no baseline version (the header read
+                        # failed too) or a divergent transcript → the plain
+                        # CAS write below deterministically raises
+                        # StaleSessionWriteError for a sidecar-loaded owner
+                        # (_persisted_generation is None). Mark retained.
+                        pass
+                    else:
+                        # Gate 2: the store validates the durable
+                        # generation+incarnation against the fallback-load
+                        # baseline inside one transaction and applies only
+                        # the proven-dirty metadata fields.
+                        _dirty = _reconcile_dirty_fields(payload, _baseline_meta)
+                        # The reconcile write and the mark-pop run under the
+                        # same per-sid lock as _demote_marked_if_recovered so
+                        # a concurrent save_metadata cannot route a draft to
+                        # the sidecar just before the pop and strand it. The
+                        # index write below stays OUTSIDE the lock: it takes
+                        # LOCK/_INDEX_WRITE_LOCK, which must never nest under
+                        # the per-sid demote lock.
+                        _row = None
+                        with _draft_demote_lock_for_sid(self.session_id):
+                            _row = store.reconcile_marked_write(
+                                self.session_id,
+                                expected_generation=int(_base_gen),
+                                expected_incarnation=int(_base_inc),
+                                fields=_dirty,
+                            )
+                            if _row is not None:
+                                store.unreadable_sids.pop(self.session_id, None)
+                        if _row is None:
+                            raise StaleSessionWriteError(
+                                f"Refusing to reconcile marked save for "
+                                f"{self.session_id!r}: durable "
+                                f"generation/incarnation moved since the "
+                                f"fallback-load baseline; reload the session "
+                                f"and retry"
+                            )
+                        # Rehydrate the in-memory owner from the authoritative
+                        # row (same construction as Session.load's SQL path):
+                        # metadata, transcript children, anchor scenes, and
+                        # _persisted_generation (the post-bump generation) all
+                        # refresh atomically while __dict__.update preserves
+                        # object identity for cached references.
+                        self.__dict__.update(Session(**_row).__dict__)
+                        if not skip_index:
+                            _write_session_index(updates=[self])
+                        return
             if not _skip_sql:
                 # The write and the mark-pop must be atomic w.r.t. a
                 # concurrent save_metadata routing on the mark (same
@@ -2115,10 +2218,17 @@ class Session:
             # The SQLite row exists but is unreadable and the sidecar just
             # proved itself the authoritative copy: route future metadata
             # writes to the sidecar too, or drafts written to SQLite would
-            # never be read back. Snapshot the sidecar draft so a later
-            # recovery can tell marked-window draft writes apart from a
-            # sidecar that simply predates the row. A successful full
-            # save() or read clears the mark. The mark check + set run
+            # never be read back. Capture the rich mark entry: the sidecar
+            # draft (so a later recovery can tell marked-window draft writes
+            # apart from a sidecar that simply predates the row), a
+            # DEEP-COPIED metadata baseline (the dirty-diff base for the
+            # store-owned reconcile — sidecar values are shared with the
+            # loaded Session and nested dicts mutate in place, so a shallow
+            # snapshot would track later edits and the diff would report
+            # nothing), and the durable generation/incarnation version
+            # (best-effort: None when the header read also fails, in which
+            # case the reconcile fails closed). A successful full save() or
+            # read clears the mark. The mark check + set run
             # under the per-sid demote lock, and an existing mark is never
             # overwritten: refreshing another loader's at-mark snapshot to
             # a sidecar draft that already includes marked-window writes
@@ -2127,9 +2237,23 @@ class Session:
             # the sidecar's draft is stable (marked-window writes are the
             # only writers and require the mark), so the snapshot taken
             # from this load's own sidecar read is exact.
+            try:
+                # BEFORE the lock: read-only and never touches the mark
+                # (same discipline as the demote probe).
+                _ver = store.read_row_version(sid)
+            except Exception:
+                _ver = None
             with _draft_demote_lock_for_sid(sid):
                 if sid not in store.unreadable_sids:
-                    store.unreadable_sids[sid] = data.get("composer_draft")
+                    store.unreadable_sids[sid] = {
+                        "composer_draft": data.get("composer_draft"),
+                        "baseline_meta": {
+                            k: copy.deepcopy(v) for k, v in data.items()
+                            if k not in _RECONCILE_BASELINE_EXCLUDED_KEYS
+                        },
+                        "baseline_generation": _ver.get("generation") if _ver else None,
+                        "baseline_incarnation": _ver.get("incarnation") if _ver else None,
+                    }
         return session
 
     @classmethod
@@ -6252,23 +6376,33 @@ def persist_recovered_workspace_binding(
                 "Failed to persist recovered workspace: unreadable session record"
             ) from exc
         current = str(meta.get("workspace") or "")
+        _new_generation = None
         if current != resolved:
             if current != expected:
                 raise WorkspaceBindingPersistenceError(
                     "Failed to persist recovered workspace: session workspace changed"
                 )
             try:
-                store.update_metadata(sid, {"workspace": resolved})
+                _meta_result = store.update_metadata(sid, {"workspace": resolved})
             except Exception as exc:
                 raise WorkspaceBindingPersistenceError(
                     "Failed to persist recovered workspace"
                 ) from exc
+            # update_metadata moves the generation fence on SQL backends:
+            # reseat the persisted lineage on every in-memory copy of this
+            # session so a later full save() still passes the CAS.
+            if isinstance(_meta_result, dict) and _meta_result.get("generation") is not None:
+                _new_generation = int(_meta_result["generation"])
 
         session.workspace = resolved
+        if _new_generation is not None:
+            session._persisted_generation = _new_generation
         with LOCK:
             cached = SESSIONS.get(sid)
             if cached is not None:
                 cached.workspace = resolved
+                if _new_generation is not None:
+                    cached._persisted_generation = _new_generation
         try:
             _write_session_index(updates=[cached or session])
         except Exception:

@@ -103,7 +103,57 @@ class SessionStore(Protocol):
         ...
 
     def update_metadata(self, sid: str, fields: dict[str, Any]) -> dict[str, Any]:
-        """Persist a subset of metadata fields without touching the transcript."""
+        """Persist a subset of metadata fields without touching the transcript.
+
+        SQL backends bump the session ``generation`` on every call (the same
+        version fence as full writes), so a metadata-only writer can never be
+        invisible to a concurrent full-save CAS. The JSON backend has no
+        generation concept: last-writer-wins, unchanged.
+        """
+        ...
+
+    def read_row_version(self, sid: str) -> dict[str, int] | None:
+        """Best-effort durable version of the live row + incarnation authority.
+
+        Returns {"generation": int, "incarnation": int} for a live (non-retired)
+        row, else None. Read-only; never raises for a healthy-but-absent row.
+        JSON backend: returns None (no durable version exists).
+        """
+        ...
+
+    def reconcile_marked_write(
+        self,
+        sid: str,
+        *,
+        expected_generation: int,
+        expected_incarnation: int,
+        fields: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Atomically reconcile a marked (sidecar-authoritative) owner onto the
+        recovered SQL row. In ONE transaction:
+
+        1. Validate the durable version: the live ``sessions`` row must exist,
+           its ``generation`` must equal ``expected_generation``, and
+           ``session_incarnations`` for the sid must be non-retired with
+           ``incarnation == expected_incarnation``.
+        2. Apply ONLY ``fields`` (same field-application policy as
+           ``update_metadata``: column/JSON classification, ``extra_json``
+           merge for unknown keys, ``null_fields_json`` maintenance,
+           ``updated_at`` only when explicitly provided).
+        3. Bump the session ``generation`` (the same version fence as full
+           writes) and the meta revision counter.
+
+        Returns the authoritative FULL row (``read_session(sid)`` shape:
+        metadata + messages/tool_calls/context_messages +
+        anchor_activity_scenes + new ``generation``) for caller rehydration.
+        Returns None on ANY validation mismatch (fail closed; no row was
+        modified; the caller must reload/retry). ``fields`` must not contain
+        ``session_id``/``messages``/``tool_calls``/``message_count``/
+        ``generation`` (ValueError, mirroring ``update_metadata``).
+
+        JSON backend: returns None (contract is SQL-only; unreachable because
+        callers gate on ``supports_generation``).
+        """
         ...
 
     def delete_session(self, sid: str) -> bool:

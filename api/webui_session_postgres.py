@@ -187,7 +187,9 @@ class WebUIPostgresSessionDB:
         self._created_by = created_by
         self._psycopg = psycopg
         self._local = threading.local()
-        self.unreadable_sids: dict[str, object] = {}
+        # Per-store failure state, mirrors the SQLite store: mark entries are
+        # dicts (see api.models Session.load).
+        self.unreadable_sids: dict[str, dict] = {}
         self._ensure_schema()
 
     def _conn(self):
@@ -530,71 +532,158 @@ class WebUIPostgresSessionDB:
                 (hsh, sid, _json_dump(scene)),
             )
 
+    _METADATA_UNSAFE_FIELDS = frozenset(
+        {"session_id", "messages", "tool_calls", "message_count", "generation"}
+    )
+
+    def _apply_metadata_fields(self, conn, sid: str, fields: dict[str, Any]) -> tuple[list[str], list[Any]]:
+        """Build (set_parts, values) for a targeted metadata UPDATE.
+
+        Same field-application policy as the SQLite store: column/JSON
+        classification, extra_json merge, null_fields_json maintenance.
+        updated_at rides in fields and is a scalar column, so the loop
+        already covers it; Postgres rejects duplicate assignments. Does NOT
+        append the sid placeholder or the generation bump.
+        """
+        set_parts: list[str] = []
+        values: list[Any] = []
+        extras: dict[str, Any] = {}
+        for k, v in fields.items():
+            if k in _SESSION_JSON_FIELDS:
+                set_parts.append(f"{k} = %s")
+                values.append(None if v is None else _json_dump(v))
+            elif k in _SESSION_SCALAR_FIELDS:
+                set_parts.append(f"{k} = %s")
+                values.append(v)
+            else:
+                extras[k] = v
+        # Maintain null key-presence across targeted updates.
+        row = conn.execute(
+            "SELECT null_fields_json FROM sessions WHERE session_id = %s", (sid,)
+        ).fetchone()
+        null_fields: list[str] = []
+        if row is not None and row[0]:
+            try:
+                parsed = json.loads(row[0])
+                if isinstance(parsed, list):
+                    null_fields = [x for x in parsed if isinstance(x, str)]
+            except (json.JSONDecodeError, TypeError):
+                pass
+        for k, v in fields.items():
+            if v is None:
+                if k not in null_fields:
+                    null_fields.append(k)
+            elif k in null_fields:
+                null_fields.remove(k)
+        set_parts.append("null_fields_json = %s")
+        values.append(_json_dump(null_fields) if null_fields else None)
+        if extras:
+            row = conn.execute(
+                "SELECT extra_json FROM sessions WHERE session_id = %s", (sid,)
+            ).fetchone()
+            current: dict[str, Any] = {}
+            if row is not None and row[0]:
+                try:
+                    parsed = json.loads(row[0])
+                    if isinstance(parsed, dict):
+                        current = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            current.update(extras)
+            set_parts.append("extra_json = %s")
+            values.append(_json_dump(current))
+        return set_parts, values
+
     def update_metadata(self, sid: str, fields: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(fields, dict):
             raise TypeError("fields must be a dict")
-        unsafe = set(fields) & {"session_id", "messages", "tool_calls", "message_count"}
+        unsafe = set(fields) & self._METADATA_UNSAFE_FIELDS
         if unsafe:
             raise ValueError(f"Unsafe session metadata fields: {', '.join(sorted(unsafe))}")
 
         conn = self._conn()
         with conn:
             self._bump_revision(conn)
-            set_parts: list[str] = []
-            values: list[Any] = []
-            extras: dict[str, Any] = {}
-            for k, v in fields.items():
-                if k in _SESSION_JSON_FIELDS:
-                    set_parts.append(f"{k} = %s")
-                    values.append(None if v is None else _json_dump(v))
-                elif k in _SESSION_SCALAR_FIELDS:
-                    set_parts.append(f"{k} = %s")
-                    values.append(v)
-                else:
-                    extras[k] = v
-            # Maintain null key-presence across targeted updates.
-            row = conn.execute(
-                "SELECT null_fields_json FROM sessions WHERE session_id = %s", (sid,)
-            ).fetchone()
-            null_fields: list[str] = []
-            if row is not None and row[0]:
-                try:
-                    parsed = json.loads(row[0])
-                    if isinstance(parsed, list):
-                        null_fields = [x for x in parsed if isinstance(x, str)]
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            for k, v in fields.items():
-                if v is None:
-                    if k not in null_fields:
-                        null_fields.append(k)
-                elif k in null_fields:
-                    null_fields.remove(k)
-            set_parts.append("null_fields_json = %s")
-            values.append(_json_dump(null_fields) if null_fields else None)
-            if extras:
-                row = conn.execute(
-                    "SELECT extra_json FROM sessions WHERE session_id = %s", (sid,)
-                ).fetchone()
-                current: dict[str, Any] = {}
-                if row is not None and row[0]:
-                    try:
-                        parsed = json.loads(row[0])
-                        if isinstance(parsed, dict):
-                            current = parsed
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                current.update(extras)
-                set_parts.append("extra_json = %s")
-                values.append(_json_dump(current))
-            # updated_at rides in fields and is a scalar column, so the loop
-            # above already covers it; Postgres rejects duplicate assignments.
+            set_parts, values = self._apply_metadata_fields(conn, sid, fields)
+            # Metadata-only writers move the same version fence as full
+            # writes (generation is never in fields, so appending is safe).
+            set_parts.append("generation = generation + 1")
             values.append(sid)
             conn.execute(
                 f"UPDATE sessions SET {', '.join(set_parts)} WHERE session_id = %s",
                 values,
             )
         return self.read_metadata_only(sid) or {}
+
+    def read_row_version(self, sid: str) -> dict[str, int] | None:
+        """Durable (generation, incarnation) of the live row (contract).
+
+        One indexed JOIN against the incarnation authority; read-only.
+        Returns None for an absent or retired row.
+        """
+        if not _is_safe_session_id(sid):
+            return None
+        row = self._conn().execute(
+            "SELECT s.generation AS generation, i.incarnation AS incarnation, "
+            "i.retired AS retired "
+            "FROM sessions s JOIN session_incarnations i "
+            "ON i.session_id = s.session_id "
+            "WHERE s.session_id = %s",
+            (sid,),
+        ).fetchone()
+        if row is None or int(row[2]):
+            return None
+        return {"generation": int(row[0] or 0), "incarnation": int(row[1])}
+
+    def reconcile_marked_write(
+        self,
+        sid: str,
+        *,
+        expected_generation: int,
+        expected_incarnation: int,
+        fields: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Atomically overlay proven-dirty metadata onto a recovered row whose
+        durable version still matches the fallback-load baseline. Fail closed
+        (None, nothing written) on any generation/incarnation mismatch."""
+        if not _is_safe_session_id(sid):
+            return None
+        if not isinstance(fields, dict):
+            raise TypeError("fields must be a dict")
+        unsafe = set(fields) & self._METADATA_UNSAFE_FIELDS
+        if unsafe:
+            raise ValueError(f"Unsafe session metadata fields: {', '.join(sorted(unsafe))}")
+
+        conn = self._conn()
+        with conn:
+            row = conn.execute(
+                "SELECT generation FROM sessions WHERE session_id = %s", (sid,)
+            ).fetchone()
+            authority = conn.execute(
+                "SELECT incarnation, retired FROM session_incarnations "
+                "WHERE session_id = %s",
+                (sid,),
+            ).fetchone()
+            if (
+                row is None
+                or authority is None
+                or int(authority[1])
+                or int(authority[0]) != int(expected_incarnation)
+                or int(row[0] or 0) != int(expected_generation)
+            ):
+                return None  # fail closed; nothing written
+            self._bump_revision(conn)
+            set_parts, values = self._apply_metadata_fields(conn, sid, fields)
+            set_parts.append("generation = generation + 1")
+            values.extend([sid, int(expected_generation)])
+            cur = conn.execute(
+                f"UPDATE sessions SET {', '.join(set_parts)} "
+                "WHERE session_id = %s AND generation = %s",
+                values,
+            )
+            if cur.rowcount != 1:
+                return None  # CAS belt-and-braces inside the txn
+        return self.read_session(sid)
 
     def delete_session(self, sid: str) -> bool:
         if not _is_safe_session_id(sid):
