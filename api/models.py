@@ -1245,6 +1245,12 @@ def model_explicit_pick_signature(model, model_provider) -> str:
 # SQLite session store singleton. Activated when sessions.db exists in the
 # session directory, otherwise the code falls back to JSON sidecars.
 _sqlite_session_store_instance = None
+# Stamp (path, mtime_ns, size) the cached NEGATIVE selection was probed
+# against. Probe-produced positive selections carry their stamp on the store
+# itself (``_selector_stamp``). A stamp change re-probes, so a long-lived
+# selector observes a later publish (the migration's atomic os.replace)
+# instead of holding a sticky False.
+_sqlite_session_store_stamp = None
 
 # Sids whose SQLite row failed to read (corrupt payload, DB read error),
 # mapped to the sidecar's composer_draft at the moment the fallback load
@@ -1362,19 +1368,60 @@ def delete_session_record(sid: str, *, owner: str = "delete_route") -> bool:
     return bool(result.get("existed"))
 
 
+def _sqlite_db_stamp(db_path: Path):
+    """(path, mtime_ns, size) stamp for the selector cache; (path, None, None)
+    when the file does not exist."""
+    try:
+        st = db_path.stat()
+    except OSError:
+        return (db_path, None, None)
+    return (db_path, st.st_mtime_ns, st.st_size)
+
+
+def _probe_sqlite_session_store(db_path: Path, stamp):
+    """Probe sessions.db for cutover authority. Returns the active store or
+    False; False results key the negative cache to ``stamp``."""
+    global _sqlite_session_store_stamp
+    if stamp[1] is None:
+        _sqlite_session_store_stamp = stamp
+        return False
+    store = WebUISqliteSessionDB(session_dir=SESSION_DIR)
+    # Durable cutover: a database left behind by an interrupted migration
+    # carries no authority until migration_complete is stamped.
+    if store.is_active():
+        store._selector_stamp = stamp
+        return store
+    try:
+        store.close()
+    except Exception:
+        pass
+    _sqlite_session_store_stamp = stamp
+    return False
+
+
 def _get_sqlite_session_store():
     global _sqlite_session_store_instance
-    if _sqlite_session_store_instance is not None:
-        return _sqlite_session_store_instance
     db_path = SESSION_DIR / "sessions.db"
-    if db_path.exists():
-        store = WebUISqliteSessionDB(session_dir=SESSION_DIR)
-        # Durable cutover: a database left behind by an interrupted migration
-        # carries no authority until migration_complete is stamped.
-        _sqlite_session_store_instance = store if store.is_active() else False
-    else:
-        _sqlite_session_store_instance = False
-    return _sqlite_session_store_instance
+    stamp = _sqlite_db_stamp(db_path)
+    cached = _sqlite_session_store_instance
+    if cached is not None and cached is not False:
+        # Positive selection. Probe-produced stores carry their stamp; a
+        # store without one was provided directly (tests) and is honored
+        # as-is.
+        sel_stamp = getattr(cached, "_selector_stamp", None)
+        if sel_stamp is None or sel_stamp == stamp:
+            return cached
+        # The file moved under the cached store (e.g. a published migration
+        # renamed over sessions.db): re-probe.
+    elif cached is False:
+        if stamp == _sqlite_session_store_stamp:
+            return False
+        # Negative cache, but the file now exists with a new stamp (e.g. a
+        # staged migration was published after this selector first looked):
+        # re-probe rather than stick on False.
+    result = _probe_sqlite_session_store(db_path, stamp)
+    _sqlite_session_store_instance = result
+    return result
 
 
 class Session:

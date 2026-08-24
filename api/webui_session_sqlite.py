@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -318,6 +320,19 @@ _SESSIONS_V2_COLUMNS: dict[str, str] = {
 }
 
 
+def _migration_crash_check(stage: str) -> None:
+    """Crash-point test hook for migration staging.
+
+    Mirrors scripts/migrate_sessions_to_sqlite.py's hook, exposed from the
+    store so tests can reach the in-constructor stages (``schema`` /
+    ``markers``) without driving the script as a subprocess. Exits 42 when
+    HERMES_MIGRATE_CRASH_AFTER names ``stage``.
+    """
+    if os.environ.get("HERMES_MIGRATE_CRASH_AFTER") == stage:
+        print(f"CRASH-INJECTED after {stage}")
+        sys.exit(42)
+
+
 class WebUISqliteSessionDB:
     """SQLite-backed WebUI session store.
 
@@ -371,32 +386,32 @@ class WebUISqliteSessionDB:
         return conn
 
     def _ensure_schema(self) -> None:
+        # Determine whether this process created the database file BEFORE
+        # opening the connection (connect creates the file). The stamp rule
+        # below needs to distinguish "we just created it" from "it
+        # pre-existed" (empty or populated) to stay fail-closed.
+        created_here = not self.db_path.exists()
         conn = self._conn()
-        conn.executescript(SCHEMA_SQL)
-        # v2 migration: dbs created before the lossless schema lack the
-        # trailing columns. Add them idempotently (fresh dbs already have
-        # them via CREATE TABLE above) and stamp the schema version.
-        existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
-        for col, ddl in _SESSIONS_V2_COLUMNS.items():
-            if col not in existing:
-                conn.execute(f"ALTER TABLE sessions ADD COLUMN {ddl}")
-        conn.executescript(_META_SQL)
-        # v5 backfill: pre-existing rows predate the incarnation authority;
-        # seed each live SID at incarnation 1, not retired.
-        conn.execute(
-            "INSERT OR IGNORE INTO session_incarnations "
-            "(session_id, incarnation, retired, retired_generation) "
-            "SELECT session_id, 1, 0, 0 FROM sessions"
-        )
-        # Durable cutover marker. Fresh app-created databases seed 'app';
-        # a db with rows but no meta predates markers ('legacy'); the
-        # migration script overwrites with 'migration' + migration_complete.
-        if conn.execute("SELECT 1 FROM meta WHERE key = 'created_by'").fetchone() is None:
-            has_rows = conn.execute("SELECT 1 FROM sessions LIMIT 1").fetchone() is not None
-            if self._created_by == "migration":
-                # Staged from creation: a database the migration script opens
-                # is incomplete until the script publishes it, even if this
-                # process dies before writing a single row.
+        if self._created_by == "migration":
+            # Two commits so a constructor crash NEVER leaves a database the
+            # app could later stamp 'app' and activate:
+            #   Commit A: tables only — a crash here leaves an UNMARKED
+            #     database, which is_active() denies (fail closed).
+            #   Commit B: the cutover markers (created_by=migration,
+            #     migration_complete=0) — a crash after this leaves a
+            #     marked-incomplete database, also denied.
+            conn.executescript(SCHEMA_SQL)
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+            for col, ddl in _SESSIONS_V2_COLUMNS.items():
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE sessions ADD COLUMN {ddl}")
+            conn.executescript(_META_SQL)
+            conn.commit()
+            _migration_crash_check("schema")
+            if conn.execute("SELECT 1 FROM meta WHERE key = 'created_by'").fetchone() is None:
+                # A database the migration tooling opens is incomplete until
+                # the script publishes it, even if this process dies before
+                # writing a single row.
                 conn.execute(
                     "INSERT INTO meta (key, value) VALUES ('created_by', ?)",
                     ("migration",),
@@ -405,11 +420,44 @@ class WebUISqliteSessionDB:
                     "INSERT INTO meta (key, value) VALUES ('migration_complete', ?)",
                     ("0",),
                 )
-            else:
-                conn.execute(
-                    "INSERT INTO meta (key, value) VALUES ('created_by', ?)",
-                    ("legacy" if has_rows else "app",),
-                )
+                conn.commit()
+            _migration_crash_check("markers")
+        else:
+            conn.executescript(SCHEMA_SQL)
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+            for col, ddl in _SESSIONS_V2_COLUMNS.items():
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE sessions ADD COLUMN {ddl}")
+            conn.executescript(_META_SQL)
+            # Durable cutover marker, fail-closed: only a database this
+            # process created is stamped 'app'; a pre-existing database with
+            # rows predates markers ('legacy'); a pre-existing EMPTY database
+            # is of unknown origin (e.g. an interrupted staged migration
+            # leftover) and is deliberately left UNMARKED — is_active()
+            # already denies it, and stamping it 'app' would activate an
+            # empty store over live JSON sidecars.
+            if conn.execute("SELECT 1 FROM meta WHERE key = 'created_by'").fetchone() is None:
+                if created_here:
+                    conn.execute(
+                        "INSERT INTO meta (key, value) VALUES ('created_by', 'app')"
+                    )
+                else:
+                    has_rows = (
+                        conn.execute("SELECT 1 FROM sessions LIMIT 1").fetchone()
+                        is not None
+                    )
+                    if has_rows:
+                        conn.execute(
+                            "INSERT INTO meta (key, value) VALUES ('created_by', 'legacy')"
+                        )
+            conn.commit()
+        # v5 backfill: pre-existing rows predate the incarnation authority;
+        # seed each live SID at incarnation 1, not retired.
+        conn.execute(
+            "INSERT OR IGNORE INTO session_incarnations "
+            "(session_id, incarnation, retired, retired_generation) "
+            "SELECT session_id, 1, 0, 0 FROM sessions"
+        )
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
 
@@ -1025,7 +1073,6 @@ def make_store(session_dir: Path | str | None = None) -> WebUISqliteSessionDB:
 
 
 if __name__ == "__main__":
-    import sys
     sd = Path(sys.argv[1]) if len(sys.argv) > 1 else None
     db = WebUISqliteSessionDB(session_dir=sd)
     print("SQLite session store ready at", db.db_path)
