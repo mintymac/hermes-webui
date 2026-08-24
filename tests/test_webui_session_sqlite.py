@@ -863,6 +863,112 @@ def test_full_save_does_not_heal_corrupt_sqlite_row(monkeypatch):
     assert len(on_disk["messages"]) == 2
 
 
+def test_marked_recovered_save_reconciles_metadata_only(monkeypatch):
+    """Greptile P1: a marked sid whose row has recovered must not fail every
+    save on the generation CAS. When the sidecar-loaded object's transcript
+    matches the recovered row (metadata-only deltas), save() reconciles: the
+    CAS generation is reseated from the probe, the row's own transcript
+    children are kept (never rolled back), the metadata edit persists, and
+    the mark clears."""
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+
+    sid = "sid-reconcile"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    # SQL row at generation 1 with transcript T; the sidecar carries the SAME
+    # transcript T but different metadata.
+    store.write_session(_sample_session_dict(sid))
+    sidecar_payload = _sample_session_dict(sid)
+    sidecar_payload["title"] = "sidecar title"
+    (d / f"{sid}.json").write_text(json.dumps(sidecar_payload), encoding="utf-8")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    # Transient failure with a sidecar: the fallback load succeeds, the sid is
+    # marked, and the object carries no persisted lineage.
+    s = models.Session.load(sid)
+    assert s is not None
+    assert sid in store.unreadable_sids
+    assert s._persisted_generation is None
+    assert s.title == "sidecar title"
+
+    # Metadata-only edit; save()'s probe reads the recovered row and must
+    # reconcile instead of raising StaleSessionWriteError.
+    s.title = "edited while marked"
+    s.save()
+
+    # The mark cleared, the generation bumped off the probe's (1 -> 2), the
+    # metadata edit persisted, and the transcript was never rolled back.
+    assert sid not in store.unreadable_sids
+    row = store.read_session(sid)
+    assert row["title"] == "edited while marked"
+    assert row["generation"] == 2
+    assert [m["content"] for m in row["messages"]] == ["hello", "hi"]
+    assert s._persisted_generation == 2
+
+
+def test_marked_recovered_save_fails_closed_on_divergent_transcript(monkeypatch):
+    """The reconcile path must never launder a divergent sidecar transcript
+    over the recovered row: when the transcripts differ, save() still fails
+    closed with StaleSessionWriteError, the row's transcript is untouched,
+    and the mark is retained."""
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+
+    sid = "sid-divergent"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    # SQL row transcript T1 (2 messages); sidecar transcript T2 (1 different
+    # message).
+    store.write_session(_sample_session_dict(sid))
+    sidecar_payload = _sample_session_dict(sid)
+    sidecar_payload["messages"] = [
+        {"role": "user", "content": "different sidecar message", "timestamp": 1000.0},
+    ]
+    (d / f"{sid}.json").write_text(json.dumps(sidecar_payload), encoding="utf-8")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    # Load fails over to the sidecar (transcript T2) and marks the sid.
+    s = models.Session.load(sid)
+    assert s is not None
+    assert sid in store.unreadable_sids
+
+    # The probe recovers, the transcripts diverge: fail closed.
+    with pytest.raises(sqlite_db.StaleSessionWriteError):
+        s.save()
+
+    # The SQL row transcript is still T1 and the mark is retained.
+    row = store.read_session(sid)
+    assert [m["content"] for m in row["messages"]] == ["hello", "hi"]
+    assert sid in store.unreadable_sids
+
+
 def test_save_metadata_falls_back_to_json_for_unmigrated_session(monkeypatch):
     """sessions.db exists but the session is JSON-only: draft autosave must
     persist to the sidecar, not raise KeyError from a zero-row SQLite UPDATE."""

@@ -1713,8 +1713,8 @@ class Session:
             # the authority. Writing it into SQL with force=True would launder
             # the (possibly stale) sidecar over the row's child collections, so
             # save() is never a force caller. The demote helper
-            # (_demote_marked_if_recovered) owns the only mark-clearing write
-            # into SQL (draft carry via update_metadata).
+            # (_demote_marked_if_recovered) and the reconcile-on-recovery
+            # branch below own the only mark-clearing writes into SQL.
             _marked = self.session_id in store.unreadable_sids
             _skip_sql = False
             if _marked:
@@ -1727,10 +1727,62 @@ class Session:
                     # mark — fall through to the JSON sidecar writer below so
                     # the authoritative sidecar is what gets rewritten.
                     _skip_sql = True
-                # else: the row recovered; proceed to the normal CAS write. A
-                # sidecar-loaded object carries _persisted_generation=None, so
-                # the CAS refuses loudly (StaleSessionWriteError) instead of
-                # rolling the row's transcript back.
+                else:
+                    # The row recovered. A sidecar-loaded object carries
+                    # _persisted_generation=None, so the plain CAS write below
+                    # would deterministically refuse (StaleSessionWriteError)
+                    # and the user's mutation could never persist ("recovered
+                    # saves always fail CAS"). Reconcile on the transcript —
+                    # messages / tool_calls / context_messages
+                    # (anchor_activity_scenes is transcript-derived, never a
+                    # rollback axis) — comparing both sides after the load-time
+                    # partial-collapse normalization, under the same canonical
+                    # JSON form as scripts/migrate_sessions_to_sqlite.py::_canon.
+                    # Transcript identical (metadata-only deltas): reseat the
+                    # CAS generation from the probe and write the in-memory
+                    # metadata over the row's OWN children — SQL children are
+                    # never rolled back. Transcript diverged: no reconcile, so
+                    # the write below raises StaleSessionWriteError exactly as
+                    # before (fail closed; a divergent transcript is never
+                    # silently dropped).
+                    def _canon_transcript(value):
+                        return json.dumps(
+                            value,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            default=str,
+                        )
+
+                    _payload_messages, _ = _collapse_adjacent_duplicate_partials(
+                        payload.get("messages")
+                    )
+                    _probe_messages, _ = _collapse_adjacent_duplicate_partials(
+                        _probe.get("messages")
+                    )
+                    if (
+                        _canon_transcript(_payload_messages)
+                        == _canon_transcript(_probe_messages)
+                        and _canon_transcript(payload.get("tool_calls"))
+                        == _canon_transcript(_probe.get("tool_calls"))
+                        and _canon_transcript(payload.get("context_messages"))
+                        == _canon_transcript(_probe.get("context_messages"))
+                    ):
+                        # Metadata-only delta: keep the in-memory metadata
+                        # (title, workspace, pinned, composer_draft, … — the
+                        # user's current edits, which are the point of the
+                        # fix), but let the recovered row's transcript
+                        # children win the write, and reseat the generation
+                        # so the CAS passes.
+                        payload["messages"] = _probe.get("messages") or []
+                        payload["tool_calls"] = _probe.get("tool_calls") or []
+                        payload["context_messages"] = (
+                            _probe.get("context_messages") or []
+                        )
+                        payload["anchor_activity_scenes"] = (
+                            _probe.get("anchor_activity_scenes") or {}
+                        )
+                        self._persisted_generation = _probe.get("generation")
             if not _skip_sql:
                 _write_result = store.write_session(
                     payload,
