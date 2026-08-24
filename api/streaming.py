@@ -2276,7 +2276,7 @@ def _cleanup_ephemeral_cancelled_turn(session) -> None:
 
     _sid = str(getattr(session, "session_id", "") or "")
     try:
-        delete_session_record(_sid)
+        delete_session_record(_sid, owner="ephemeral")
     except Exception:
         # Retain retryable ownership: a failed authoritative deletion must
         # not masquerade as a successful cleanup (or the row leaks while the
@@ -10843,7 +10843,7 @@ def _run_agent_streaming(
                 try:
                     from api.models import delete_session_record
 
-                    delete_session_record(str(getattr(s, "session_id", "") or ""))
+                    delete_session_record(str(getattr(s, "session_id", "") or ""), owner="ephemeral")
                     import pathlib
 
                     pathlib.Path(s.path).unlink(missing_ok=True)

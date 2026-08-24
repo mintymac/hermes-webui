@@ -22255,9 +22255,23 @@ def _handle_memory_read(handler, parsed=None):
 
 def _handle_sessions_cleanup(handler, body, zero_only=False):
     cleaned = 0
+    failed = []
     phase1_removed_ids = set()
 
-    # Phase 1: Clean orphan session files (existing behavior).
+    try:
+        from api.models import get_session_store
+
+        _store = get_session_store()
+    except Exception:
+        logger.debug("Store unavailable during sessions cleanup", exc_info=True)
+        _store = None
+
+    # Phase 1: collect candidate sids (JSON sidecars + SQL-backed rows) and
+    # evaluate the Untitled/zero-message predicate. Collection is
+    # side-effect free — NO unlinks, NO cache pops — so a failed
+    # authoritative delete below leaves every representation (SQL row AND
+    # sidecar) in place for the retry owner recorded in the cleanup lease.
+    candidates = set()
     for p in SESSION_DIR.glob("*.json"):
         if p.name.startswith("_"):
             continue
@@ -22268,24 +22282,17 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
             else:
                 should_delete = s and s.title == "Untitled" and len(s.messages) == 0
             if should_delete:
-                with LOCK:
-                    SESSIONS.pop(p.stem, None)
-                p.unlink(missing_ok=True)
-                cleaned += 1
-                phase1_removed_ids.add(p.stem)
+                candidates.add(p.stem)
         except Exception:
-            logger.debug("Failed to clean up session file %s", p)
+            logger.debug("Failed to evaluate session file %s for cleanup", p)
 
-    # Phase 1b: SQL-backed sessions (no sidecar) — same predicates via the
-    # canonical store so DB-only zero-message sessions are cleaned too.
-    try:
-        from api.models import get_session_store
-
-        _store = get_session_store()
-        if _store.supports_generation:
+    # SQL-backed sessions (no sidecar) — same predicates via the canonical
+    # store so DB-only zero-message sessions are cleaned too.
+    if _store is not None and _store.supports_generation:
+        try:
             for _meta in _store.list_sessions():
                 _sid = str(_meta.get("session_id") or "").strip()
-                if not _sid or _sid in phase1_removed_ids:
+                if not _sid or _sid in candidates:
                     continue
                 try:
                     s = Session.load(_sid)
@@ -22294,15 +22301,42 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
                     else:
                         should_delete = s and s.title == "Untitled" and len(s.messages) == 0
                     if should_delete:
-                        with LOCK:
-                            SESSIONS.pop(_sid, None)
-                        _store.delete_session(_sid)
-                        cleaned += 1
-                        phase1_removed_ids.add(_sid)
+                        candidates.add(_sid)
                 except Exception:
-                    logger.debug("Failed to clean up SQL-backed session %s", _sid)
-    except Exception:
-        logger.debug("Store unavailable during sessions cleanup", exc_info=True)
+                    logger.debug("Failed to evaluate SQL-backed session %s for cleanup", _sid)
+        except Exception:
+            logger.debug("Store listing unavailable during sessions cleanup", exc_info=True)
+
+    # Phase 1 delete: the store owns the authoritative record. The sidecar
+    # unlink and cache pop happen ONLY after an ok result, so a dual-rep
+    # session never loses its sidecar before a failed SQL delete. On
+    # failure everything is retained and the sid is reported in `failed`.
+    for _sid in sorted(candidates):
+        if _store is None:
+            failed.append(_sid)
+            continue
+        try:
+            _result = _store.lifecycle_delete(_sid, owner="sessions_cleanup")
+        except Exception as _exc:
+            _result = {"ok": False, "error": f"{type(_exc).__name__}: {_exc}"}
+        if _result.get("ok"):
+            with LOCK:
+                SESSIONS.pop(_sid, None)
+            _sidecar = SESSION_DIR / f"{_sid}.json"
+            try:
+                _sidecar.unlink(missing_ok=True)
+                _sidecar.with_suffix(".json.bak").unlink(missing_ok=True)
+            except Exception:
+                logger.debug("Failed to unlink sidecar for cleaned session %s", _sid)
+            cleaned += 1
+            phase1_removed_ids.add(_sid)
+        else:
+            logger.warning(
+                "Cleanup delete failed for %s; retained for retry (%s)",
+                _sid,
+                _result.get("error"),
+            )
+            failed.append(_sid)
 
     phase1_touched = bool(cleaned)
     phase2_rewrote_index = False
@@ -22395,7 +22429,7 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
     if phase1_touched and not phase2_rewrote_index and SESSION_INDEX_FILE.exists():
         SESSION_INDEX_FILE.unlink(missing_ok=True)
 
-    return j(handler, {"ok": True, "cleaned": cleaned})
+    return j(handler, {"ok": not failed, "cleaned": cleaned, "failed": failed})
 
 
 def _handle_btw(handler, body):
@@ -22547,7 +22581,7 @@ def _handle_background(handler, body):
             try:
                 from api.models import delete_session_record
 
-                delete_session_record(bg_sid)
+                delete_session_record(bg_sid, owner="background")
             except Exception:
                 logger.warning(
                     "Failed to delete bg session %s from store; retaining for retry",

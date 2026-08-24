@@ -175,6 +175,27 @@ class WebUIJsonSessionDB:
             return False
         return existed
 
+    def lifecycle_delete(self, sid: str, *, owner: str) -> dict[str, Any]:
+        """Delete with retry-ownership semantics (SessionStore contract).
+
+        The JSON backend has no crash-safe lease: sidecars are
+        last-writer-wins files, so a failure result here is process-local
+        only — the caller retains retry ownership by keeping the file.
+        """
+        path = self._path_for_sid(sid)
+        existed = path is not None and path.exists()
+        try:
+            self.delete_session(sid)
+        except OSError as exc:
+            return {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "existed": existed,
+            }
+        if existed and path is not None and path.exists():
+            return {"ok": False, "error": "sidecar still present after delete", "existed": True}
+        return {"ok": True, "existed": existed}
+
     def get_revision(self) -> int:
         """JSON freshness signal: the session directory mtime in ns.
 

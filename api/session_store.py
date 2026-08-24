@@ -103,6 +103,25 @@ class SessionStore(Protocol):
         """Remove the session and all its state. True if a row/file existed."""
         ...
 
+    def lifecycle_delete(self, sid: str, *, owner: str) -> dict[str, Any]:
+        """Delete the store-owned representation with durable retry ownership.
+
+        Returns ``{"ok": True, "existed": bool}`` on success, or
+        ``{"ok": False, "error": str, "existed": bool}`` on failure.
+
+        On failure the store persists a retry lease keyed by ``sid`` (in
+        ``cleanup_leases``) recording ``owner`` and the error, so a later
+        sweep retains an authoritative retry owner instead of silently
+        leaking the row. On success any lease for ``sid`` is cleared. The
+        store never touches a representation it does not own (e.g. the
+        SQL stores do not unlink JSON sidecars — callers do that only
+        after an ``ok`` result).
+
+        The JSON sidecar backend has no crash-safe lease (last-writer-wins
+        file semantics); its failure result is process-local only.
+        """
+        ...
+
     def archive(self, sid: str, archived: bool = True) -> dict[str, Any]:
         ...
 

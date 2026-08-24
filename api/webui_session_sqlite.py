@@ -696,6 +696,55 @@ class WebUISqliteSessionDB:
                 )
         return cur.rowcount > 0
 
+    def lifecycle_delete(self, sid: str, *, owner: str) -> dict[str, Any]:
+        """Delete with durable retry ownership (SessionStore contract).
+
+        Success clears any cleanup lease for ``sid`` in the same store;
+        failure records a lease keyed by ``sid`` so the retry owner
+        survives a crash. Never touches the JSON sidecar — that
+        representation is not store-owned.
+        """
+        conn = self._conn()
+        try:
+            existed = self.delete_session(sid)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            with conn:
+                conn.execute(
+                    "INSERT INTO cleanup_leases "
+                    "(session_id, owner, error, updated_at, attempts) "
+                    "VALUES (?, ?, ?, ?, 1) "
+                    "ON CONFLICT(session_id) DO UPDATE SET "
+                    "owner = excluded.owner, error = excluded.error, "
+                    "updated_at = excluded.updated_at, "
+                    "attempts = attempts + 1",
+                    (sid, owner, error, time.time()),
+                )
+            try:
+                existed = self.session_exists(sid)
+            except Exception:
+                existed = False
+            return {"ok": False, "error": error, "existed": existed}
+        with conn:
+            conn.execute("DELETE FROM cleanup_leases WHERE session_id = ?", (sid,))
+        return {"ok": True, "existed": bool(existed)}
+
+    def list_cleanup_leases(self, owner: str | None = None) -> list[dict[str, Any]]:
+        """Durable retry leases recorded by failed ``lifecycle_delete`` calls."""
+        conn = self._conn()
+        if owner is None:
+            rows = conn.execute(
+                "SELECT session_id, owner, error, updated_at, attempts "
+                "FROM cleanup_leases ORDER BY updated_at"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT session_id, owner, error, updated_at, attempts "
+                "FROM cleanup_leases WHERE owner = ? ORDER BY updated_at",
+                (owner,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def archive(self, sid: str, archived: bool = True) -> dict[str, Any]:
         return self.update_metadata(sid, {"archived": bool(archived)})
 

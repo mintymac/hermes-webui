@@ -1545,6 +1545,132 @@ def test_sessions_cleanup_removes_db_only_zero_message_untitled(monkeypatch):
     assert store.session_exists("sid-zero") is False
 
 
+def test_cleanup_delete_failure_is_truthful_and_durable(monkeypatch):
+    """A failed store delete must report ok=False, retain the row, and
+    record a durable cleanup lease owned by sessions_cleanup — never an
+    unconditional ok:true after failure."""
+    import sqlite3 as _sq
+
+    import api.routes as routes
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-boom")
+    payload["title"] = "Untitled"
+    payload["messages"] = []
+    store.write_session(payload)
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_delete = store.delete_session
+
+    def _boom(sid_):
+        raise _sq.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "delete_session", _boom)
+
+    captured = {}
+    monkeypatch.setattr(
+        routes, "j", lambda handler, payload, **kwargs: captured.update(payload) or True
+    )
+    handler = SimpleNamespace(_safe_webui_print=lambda *_a, **_k: None)
+    routes._handle_sessions_cleanup(handler, {}, zero_only=False)
+
+    assert captured["ok"] is False
+    assert "sid-boom" in captured["failed"]
+    assert captured["cleaned"] == 0
+    # Row retained — the retry owner is durable, not just logged.
+    assert store.session_exists("sid-boom") is True
+    leases = store.list_cleanup_leases()
+    assert [l["session_id"] for l in leases] == ["sid-boom"]
+    assert leases[0]["owner"] == "sessions_cleanup"
+    assert leases[0]["attempts"] == 1
+
+    # A later sweep with a healthy store clears the lease and the row.
+    monkeypatch.setattr(store, "delete_session", real_delete)
+    captured.clear()
+    routes._handle_sessions_cleanup(handler, {}, zero_only=False)
+    assert captured["ok"] is True
+    assert "sid-boom" in captured["failed"] or captured["failed"] == []
+    assert store.session_exists("sid-boom") is False
+    assert store.list_cleanup_leases() == []
+
+
+def test_cleanup_delete_failure_keeps_sidecar_for_dual_rep(monkeypatch):
+    """Dual-rep session: a failed SQL delete must NOT have unlinked the
+    sidecar first — collection is side-effect free and the sidecar unlink
+    only happens after an ok lifecycle_delete."""
+    import sqlite3 as _sq
+
+    import api.routes as routes
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-dual")
+    payload["title"] = "Untitled"
+    payload["messages"] = []
+    store.write_session(payload)
+    sidecar = d / "sid-dual.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    (d / "sid-dual.json.bak").write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    def _boom(sid_):
+        raise _sq.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "delete_session", _boom)
+
+    captured = {}
+    monkeypatch.setattr(
+        routes, "j", lambda handler, payload, **kwargs: captured.update(payload) or True
+    )
+    handler = SimpleNamespace(_safe_webui_print=lambda *_a, **_k: None)
+    routes._handle_sessions_cleanup(handler, {}, zero_only=False)
+
+    assert captured["ok"] is False
+    assert "sid-dual" in captured["failed"]
+    assert store.session_exists("sid-dual") is True
+    # Both representations survive the failed authoritative delete.
+    assert sidecar.exists() is True
+    assert (d / "sid-dual.json.bak").exists() is True
+    assert store.list_cleanup_leases()[0]["owner"] == "sessions_cleanup"
+
+
+def test_ephemeral_cancel_cleanup_records_durable_lease(monkeypatch):
+    """Failed ephemeral cleanup records a cleanup lease owned by ephemeral."""
+    import sqlite3 as _sq
+
+    import api.streaming as streaming
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-ephem3"))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+    monkeypatch.setattr(streaming, "SESSION_DIR", d)
+
+    def _boom(sid_):
+        raise _sq.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "delete_session", _boom)
+
+    class FakeEphemeralSession:
+        session_id = "sid-ephem3"
+        path = d / "sid-ephem3.json"
+        active_stream_id = "live"
+        pending_user_message = "x"
+        pending_attachments = []
+        pending_started_at = 1.0
+        pending_user_source = None
+
+    streaming._cleanup_ephemeral_cancelled_turn(FakeEphemeralSession())
+    assert store.session_exists("sid-ephem3") is True
+    leases = store.list_cleanup_leases()
+    assert [l["session_id"] for l in leases] == ["sid-ephem3"]
+    assert leases[0]["owner"] == "ephemeral"
+
+
 def _drive_delete_post(monkeypatch, body):
     """Run POST /api/session/delete through routes.handle_post (CSRF bypassed,
     JSON responders captured) and return the captured response."""

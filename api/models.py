@@ -1252,9 +1252,10 @@ _sqlite_session_store_instance = None
 # BOTH reads (Session.load / load_metadata_only) and metadata writes
 # (save_metadata) — keeping one store on both sides is what prevents
 # drafts saved during the outage from disappearing behind a flip back to
-# SQLite. The mark clears when a full save() heals the row with the
-# (sidecar-loaded) in-memory state, or when the sidecar disappears and
-# the row reads healthy again.
+# SQLite. The mark clears via demote-on-recovery: when a probe of the row
+# reads healthy again, _demote_marked_if_recovered carries any sidecar
+# draft written during the outage into the row and pops the mark. A full
+# save() alone no longer heals the row (removed in blocker 2).
 def _demote_marked_if_recovered(store, sid: str):
     """Probe a marked sid's row; on full-read success, carry any
     marked-window sidecar draft into the row, pop the mark, and return the
@@ -1311,21 +1312,24 @@ def get_session_store():
     return WebUIJsonSessionDB(session_dir=SESSION_DIR)
 
 
-def delete_session_record(sid: str) -> bool:
+def delete_session_record(sid: str, *, owner: str = "delete_route") -> bool:
     """Remove a session's authoritative record via the canonical store.
 
-    SQL backends delete the row (and transcript) — and RAISE on failure so
-    callers can retain retryable ownership instead of reporting a cleanup
-    that silently leaked the row. The JSON backend unlinks the sidecar.
-    Sidecar unlinks for SQL-backed cleanups are left to callers
-    (``missing_ok=True``).
+    Delegates to the store's ``lifecycle_delete`` so a failed delete
+    records a durable retry lease (SQL backends) keyed by ``sid`` with
+    ``owner`` — the retry owner survives a crash instead of silently
+    leaking the row. Raises on ``{"ok": False}`` so the delete route
+    keeps its fail-closed 500 and cleanup callers retain retry ownership
+    instead of reporting a cleanup that silently leaked the record.
+    Returns whether the record existed. Sidecar unlinks for SQL-backed
+    cleanups are left to callers (``missing_ok=True``).
     """
-    store = get_session_store()
-    if not store.supports_generation:
-        return store.delete_session(sid)
-    if store.session_exists(sid):
-        store.delete_session(sid)
-    return True
+    result = get_session_store().lifecycle_delete(sid, owner=owner)
+    if not result.get("ok"):
+        raise RuntimeError(
+            f"lifecycle_delete failed for session {sid}: {result.get('error')}"
+        )
+    return bool(result.get("existed"))
 
 
 def _get_sqlite_session_store():
