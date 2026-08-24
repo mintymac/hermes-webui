@@ -379,26 +379,41 @@ def test_null_valued_keys_round_trip_with_presence(monkeypatch):
     assert "threshold_tokens" in reloaded and reloaded["threshold_tokens"] is None
 
 
-def test_save_heal_bypasses_fence_for_marked_session(monkeypatch):
-    """A marked (unreadable) session may have a row newer than its sidecar;
-    the heal save must bypass the fence."""
+def test_marked_save_does_not_launder_stale_sidecar_over_sql(monkeypatch):
+    """A marked (unreadable) sid's save() must fail closed: never write the
+    stale sidecar state into the SQL row, keep the unreadable mark, and only
+    rewrite the sidecar (the marked authority)."""
     import sqlite3 as _sq
 
     d = _tmp_session_dir()
     monkeypatch.setattr(models, "SESSION_DIR", d)
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
 
-    sid = "sid-healfence"
+    sid = "sid-nolaunder"
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
-    payload = _sample_session_dict(sid)
-    payload["updated_at"] = 9000.0  # row newer than the sidecar below
-    store.write_session(payload)
-    sidecar = _sample_session_dict(sid)
-    sidecar["updated_at"] = 1000.0
-    (d / f"{sid}.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    # Differing transcripts: SQL row is newer with distinct children.
+    row_payload = _sample_session_dict(sid)
+    row_payload["messages"] = [
+        {"role": "user", "content": "old", "timestamp": 1000.0},
+        {"role": "assistant", "content": "NEWER SQL CHILD", "timestamp": 1001.0},
+    ]
+    store.write_session(row_payload)
+    sidecar_payload = _sample_session_dict(sid)
+    sidecar_payload["messages"] = [
+        {"role": "user", "content": "stale sidecar only", "timestamp": 1000.0},
+    ]
+    (d / f"{sid}.json").write_text(json.dumps(sidecar_payload), encoding="utf-8")
     monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
 
+    # Capture original message bodies, then corrupt the SQL transcript so the
+    # next read fails and the sid is marked.
     conn = _sq.connect(str(d / "sessions.db"))
+    originals = [
+        r[0] for r in conn.execute(
+            "SELECT message_json FROM messages WHERE session_id = ? ORDER BY idx",
+            (sid,),
+        ).fetchall()
+    ]
     conn.execute("UPDATE messages SET message_json = 'bad' WHERE session_id = ?", (sid,))
     conn.commit()
     conn.close()
@@ -406,10 +421,31 @@ def test_save_heal_bypasses_fence_for_marked_session(monkeypatch):
     s = models.Session.load(sid)
     assert s is not None
     assert sid in store.unreadable_sids
+    generation_at_mark = store.read_metadata_only(sid)["generation"]
 
-    s.save()  # must not raise StaleSessionWriteError despite the older sidecar state
-    assert sid not in store.unreadable_sids
-    assert models.Session.load(sid) is not None
+    s.save()  # must not raise StaleSessionWriteError and must not touch SQL
+
+    # Fail-closed: the mark is retained and the SQL row generation is unmoved.
+    assert sid in store.unreadable_sids
+    assert store.read_metadata_only(sid)["generation"] == generation_at_mark
+
+    # Repair the transcript and prove the SQL children survived — no stale
+    # sidecar body was laundered over them.
+    conn = _sq.connect(str(d / "sessions.db"))
+    for idx, original in enumerate(originals):
+        conn.execute(
+            "UPDATE messages SET message_json = ? WHERE session_id = ? AND idx = ?",
+            (original, sid, idx),
+        )
+    conn.commit()
+    conn.close()
+    children = [m["content"] for m in store.read_session(sid)["messages"]]
+    assert children == ["old", "NEWER SQL CHILD"]
+
+    # The sidecar (the marked authority) may be rewritten from the in-memory
+    # object — assert its contents independently of SQL.
+    on_disk = json.loads((d / f"{sid}.json").read_text(encoding="utf-8"))
+    assert [m["content"] for m in on_disk["messages"]] == ["stale sidecar only"]
 
 
 def test_incomplete_migration_does_not_activate_store(monkeypatch):
@@ -778,9 +814,10 @@ def test_marked_sid_without_sidecar_falls_back_to_healthy_row(monkeypatch):
     assert sid not in store.unreadable_sids
 
 
-def test_full_save_heals_corrupt_sqlite_row(monkeypatch):
-    """A successful full save() rewrites the row with healthy data and
-    clears the unreadable mark, so draft routing returns to SQLite."""
+def test_full_save_does_not_heal_corrupt_sqlite_row(monkeypatch):
+    """A full save() fails closed on a marked sid: the corrupt row is not
+    force-overwritten, the unreadable mark is retained, and only the sidecar
+    (the marked authority) is rewritten."""
     import sqlite3 as _sq
 
     d = _tmp_session_dir()
@@ -806,15 +843,24 @@ def test_full_save_heals_corrupt_sqlite_row(monkeypatch):
 
     s = models.Session.load(sid)
     assert sid in store.unreadable_sids
+    generation_at_mark = store.read_metadata_only(sid)["generation"]
 
     s.save()
-    assert sid not in store.unreadable_sids
 
-    # The row is healthy again: loads come from SQLite, drafts route there.
-    (d / f"{sid}.json").unlink()
-    reloaded = models.Session.load(sid)
-    assert reloaded is not None
-    assert len(reloaded.messages) == 2
+    # Mark retained: no force-heal was performed and the row generation did
+    # not move — the corrupt child rows are still exactly as seeded.
+    assert sid in store.unreadable_sids
+    assert store.read_metadata_only(sid)["generation"] == generation_at_mark
+    conn = _sq.connect(str(d / "sessions.db"))
+    raw = conn.execute(
+        "SELECT message_json FROM messages WHERE session_id = ?", (sid,)
+    ).fetchall()
+    conn.close()
+    assert raw and all(r[0] == "not-json" for r in raw)
+
+    # The sidecar remains the authority and carries the in-memory messages.
+    on_disk = json.loads((d / f"{sid}.json").read_text(encoding="utf-8"))
+    assert len(on_disk["messages"]) == 2
 
 
 def test_save_metadata_falls_back_to_json_for_unmigrated_session(monkeypatch):

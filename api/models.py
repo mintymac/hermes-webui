@@ -1627,52 +1627,41 @@ class Session:
             payload.setdefault("tool_calls", [])
             payload.setdefault("context_messages", [])
             payload.setdefault("anchor_activity_scenes", {})
-            # force only for a deliberate heal of a row marked unreadable.
-            # expected_generation carries the CAS lineage the object was
-            # loaded with; the store compares-and-bumps atomically.
-            _heal = self.session_id in store.unreadable_sids
-            if _heal:
-                # Force-heal only while the row is genuinely unreadable. If
-                # it recovered, this sidecar-loaded object is a stale reader
-                # whose transcript predates the row's — refusing via the
-                # generation CAS beats silently rolling the row back.
+            # Marked-unreadable fail-closed routing: while a sid is marked, its
+            # in-memory object came from the JSON sidecar, and that sidecar is
+            # the authority. Writing it into SQL with force=True would launder
+            # the (possibly stale) sidecar over the row's child collections, so
+            # save() is never a force caller. The demote helper
+            # (_demote_marked_if_recovered) owns the only mark-clearing write
+            # into SQL (draft carry via update_metadata).
+            _marked = self.session_id in store.unreadable_sids
+            _skip_sql = False
+            if _marked:
                 try:
-                    _row_probe = store.read_session(self.session_id)
+                    _probe = store.read_session(self.session_id)
                 except Exception:
-                    _row_probe = None
-                if _row_probe is None:
-                    # The row's header may still be readable even when the
-                    # transcript is not. If no draft was written while
-                    # marked (the in-memory draft still equals the mark-time
-                    # sidecar value), the row's draft is the newer truth —
-                    # carry it through the heal instead of regressing it.
-                    _at_mark = store.unreadable_sids.get(self.session_id)
-                    try:
-                        _row_meta = store.read_metadata_only(self.session_id)
-                    except Exception:
-                        _row_meta = None
-                    if _row_meta is not None:
-                        _row_draft = _row_meta.get("composer_draft")
-                        if (
-                            _row_draft is not None
-                            and getattr(self, "composer_draft", None) == _at_mark
-                            and _row_draft != _at_mark
-                        ):
-                            self.composer_draft = _row_draft
-                            payload["composer_draft"] = _row_draft
-                else:
-                    _heal = False
-            _write_result = store.write_session(
-                payload,
-                expected_generation=getattr(self, "_persisted_generation", None),
-                force=_heal,
-            )
-            store.unreadable_sids.pop(self.session_id, None)
-            if isinstance(_write_result, dict) and _write_result.get("generation") is not None:
-                self._persisted_generation = _write_result["generation"]
-            if not skip_index:
-                _write_session_index(updates=[self])
-            return
+                    _probe = None
+                if _probe is None:
+                    # Still unreadable: do NOT write SQL and do NOT pop the
+                    # mark — fall through to the JSON sidecar writer below so
+                    # the authoritative sidecar is what gets rewritten.
+                    _skip_sql = True
+                # else: the row recovered; proceed to the normal CAS write. A
+                # sidecar-loaded object carries _persisted_generation=None, so
+                # the CAS refuses loudly (StaleSessionWriteError) instead of
+                # rolling the row's transcript back.
+            if not _skip_sql:
+                _write_result = store.write_session(
+                    payload,
+                    expected_generation=getattr(self, "_persisted_generation", None),
+                    force=False,
+                )
+                store.unreadable_sids.pop(self.session_id, None)
+                if isinstance(_write_result, dict) and _write_result.get("generation") is not None:
+                    self._persisted_generation = _write_result["generation"]
+                if not skip_index:
+                    _write_session_index(updates=[self])
+                return
         if touch_updated_at:
             self.updated_at = time.time()
         # Write metadata fields first so load_metadata_only() can read them
