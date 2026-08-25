@@ -1061,6 +1061,71 @@ def test_marked_reconcile_overlays_only_proven_dirty_metadata(monkeypatch):
     assert s._persisted_generation == 2
 
 
+def test_marked_reconcile_sparse_sidecar_does_not_launder_constructor_defaults(monkeypatch):
+    """Task 010: absent legacy sidecar keys are not dirty.
+
+    A sparse legacy sidecar omits pinned/input_tokens entirely; the fallback
+    load materializes constructor defaults (pinned=False, input_tokens=0)
+    into the in-memory owner. On the parent tree the baseline is the RAW
+    sidecar dict, so every defaulted field diffs dirty and the reconcile
+    launders the defaults over the recovered row's newer SQL-side values.
+    With the post-construction baseline the defaults appear on BOTH sides
+    and cancel: only the genuine edit (title, updated_at) overlays.
+    """
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+
+    sid = "sid-sparse-baseline"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    # SQL row at generation 1 with NEWER metadata (post-sidecar SQL edits).
+    row_payload = _sample_session_dict(sid)
+    row_payload.update({"pinned": True, "workspace": "/sql", "input_tokens": 1234})
+    store.write_session(row_payload)
+    # Sparse legacy sidecar: SAME transcript, only title/workspace present —
+    # pinned/input_tokens (and every other later-era key) OMITTED.
+    sidecar_payload = _sample_session_dict(sid)
+    sidecar_payload.update({"title": "sidecar title", "workspace": "/json"})
+    assert "pinned" not in sidecar_payload and "input_tokens" not in sidecar_payload
+    (d / f"{sid}.json").write_text(json.dumps(sidecar_payload), encoding="utf-8")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    s = models.Session.load(sid)
+    assert s is not None
+    assert sid in store.unreadable_sids
+    assert s._persisted_generation is None
+    assert s.pinned is False and s.input_tokens == 0  # constructor defaults
+
+    s.title = "edited"
+    s.save()
+
+    # Absent sidecar keys were NOT dirty: the row's newer SQL-side values
+    # survived; only the proven edit (title) + updated_at overlaid.
+    assert sid not in store.unreadable_sids
+    row = store.read_session(sid)
+    assert row["title"] == "edited"
+    assert row["pinned"] is True          # parent: False (default laundered) → FAILS
+    assert row["input_tokens"] == 1234    # parent: 0 (default laundered) → FAILS
+    assert row["workspace"] == "/sql"
+    assert row["generation"] == 2
+    assert s._persisted_generation == 2
+    # Rehydration adopted the authoritative row values.
+    assert s.pinned is True and s.input_tokens == 1234
+
+
 def test_marked_reconcile_fenced_against_concurrent_update_metadata(monkeypatch):
     """Finding 4: metadata-only writers move the version fence.
 

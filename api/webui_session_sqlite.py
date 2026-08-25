@@ -359,7 +359,8 @@ class WebUISqliteSessionDB:
         # Per-store failure state: sids whose row failed to read and whose
         # sidecar became authoritative. Each mark entry is a dict:
         # {"composer_draft": sidecar draft at mark time, "baseline_meta":
-        # deep-copied metadata snapshot, "baseline_generation": int | None,
+        # deep-copied post-construction payload projection snapshot,
+        # "baseline_generation": int | None,
         # "baseline_incarnation": int | None} (see api.models Session.load).
         self.unreadable_sids: dict[str, dict] = {}
         self._ensure_schema()

@@ -1257,8 +1257,9 @@ _sqlite_session_store_stamp = None
 # succeeded:
 #   {
 #     "composer_draft":       sidecar draft at mark time (demote carry),
-#     "baseline_meta":        deep-copied sidecar metadata snapshot (the
-#                             dirty-diff base for the store-owned reconcile),
+#     "baseline_meta":        deep-copied post-construction payload
+#                             projection snapshot (the dirty-diff base for
+#                             the store-owned reconcile),
 #     "baseline_generation":  durable row generation at mark time, or None
 #                             when the header read also failed (fail closed),
 #     "baseline_incarnation": durable incarnation at mark time, or None,
@@ -1324,6 +1325,23 @@ _RECONCILE_BASELINE_EXCLUDED_KEYS = {
     "message_count", "last_message_at",                # computed
     "generation", "incarnation",         # owned by the store fence, never by metadata
 }
+
+
+def _session_payload_projection(obj) -> dict:
+    """The exact flattened payload save() hands to the store: __dict__ minus
+    _-prefixed attrs, extra_session_fields splatted under modeled attrs, with
+    the child-collection defaults materialized. Shared by save() and the
+    fallback-load baseline snapshot so the two views are like-for-like."""
+    payload = {k: v for k, v in obj.__dict__.items() if not k.startswith("_")}
+    _extra_bag = payload.pop("extra_session_fields", None)
+    if isinstance(_extra_bag, dict):
+        for _k, _v in _extra_bag.items():
+            payload.setdefault(_k, _v)
+    payload.setdefault("messages", [])
+    payload.setdefault("tool_calls", [])
+    payload.setdefault("context_messages", [])
+    payload.setdefault("anchor_activity_scenes", {})
+    return payload
 
 
 def _reconcile_dirty_fields(payload: dict, baseline_meta: dict) -> dict:
@@ -1866,15 +1884,7 @@ class Session:
         if store.supports_generation:
             if touch_updated_at:
                 self.updated_at = time.time()
-            payload = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
-            _extra_bag = payload.pop("extra_session_fields", None)
-            if isinstance(_extra_bag, dict):
-                for _k, _v in _extra_bag.items():
-                    payload.setdefault(_k, _v)
-            payload.setdefault("messages", [])
-            payload.setdefault("tool_calls", [])
-            payload.setdefault("context_messages", [])
-            payload.setdefault("anchor_activity_scenes", {})
+            payload = _session_payload_projection(self)
             # Marked-unreadable fail-closed routing: while a sid is marked, its
             # in-memory object came from the JSON sidecar, and that sidecar is
             # the authority. Writing it into SQL with force=True would launder
@@ -2300,7 +2310,8 @@ class Session:
                     store.unreadable_sids[sid] = {
                         "composer_draft": data.get("composer_draft"),
                         "baseline_meta": {
-                            k: copy.deepcopy(v) for k, v in data.items()
+                            k: copy.deepcopy(v)
+                            for k, v in _session_payload_projection(session).items()
                             if k not in _RECONCILE_BASELINE_EXCLUDED_KEYS
                         },
                         "baseline_generation": _ver.get("generation") if _ver else None,
