@@ -67,20 +67,29 @@ class SessionStore(Protocol):
         session: dict[str, Any],
         *,
         expected_generation: int | None = None,
+        expected_incarnation: int | None = None,
         force: bool = False,
         fresh_incarnation: bool = False,
     ) -> dict[str, Any]:
         """Persist a full session dict; returns the persisted representation.
 
-        SQL backends enforce a durable per-session generation CAS, backed by
-        a per-SID incarnation authority (``session_incarnations``) that
-        survives ``delete_session``:
+        SQL backends enforce a durable per-session writer token — the
+        (incarnation, generation) pair — backed by a per-SID incarnation
+        authority (``session_incarnations``) that survives
+        ``delete_session``:
 
         - Live row: ``expected_generation`` must match the row's generation
-          (compare-and-bump); ``force=True`` may overwrite a live row for
-          deliberate heals/imports. Anything else raises
-          ``StaleSessionWriteError``.
-        - Absent row, no authority, no lineage: first create at generation 1.
+          AND ``expected_incarnation`` must match the authority's
+          non-retired incarnation (compare-and-bump); a missing/None
+          incarnation half, a retired authority, or either mismatch raises
+          ``StaleSessionWriteError``. The pair is what discriminates a
+          delete + same-SID recreate, which restarts the generation at 1.
+          ``force=True`` may overwrite a live row for deliberate
+          heals/imports and never consults the authority.
+        - Absent row, no authority, no lineage: first create at generation 1
+          (``expected_incarnation`` is ignored on every absent-row path —
+          the generation lineage plus the retired authority already
+          discriminate).
         - Absent row with a non-None ``expected_generation``: the writer
           carries lineage for a session that is gone —
           ``DeletedSessionWriteError``.
@@ -95,20 +104,37 @@ class SessionStore(Protocol):
           never do. A leftover sidecar of the old incarnation is stale and
           is unlinked only by cleanup/delete, never by recreate.
 
-        The returned dict carries the new ``generation``.
-        JSON backends accept only ``expected_generation``/``force`` (both
-        ignored — last-writer-wins atomic replace); ``fresh_incarnation``
-        is SQL-only and must not be passed to a JSON store.
+        The returned dict carries the new ``generation`` and the current
+        ``incarnation`` (reads JOIN the authority).
+        JSON backends accept and ignore the token kwargs (last-writer-wins
+        atomic replace); ``fresh_incarnation`` is SQL-only and must not be
+        passed to a JSON store.
         """
         ...
 
-    def update_metadata(self, sid: str, fields: dict[str, Any]) -> dict[str, Any]:
+    def update_metadata(
+        self,
+        sid: str,
+        fields: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+        expected_incarnation: int | None = None,
+    ) -> dict[str, Any]:
         """Persist a subset of metadata fields without touching the transcript.
 
         SQL backends bump the session ``generation`` on every call (the same
         version fence as full writes), so a metadata-only writer can never be
-        invisible to a concurrent full-save CAS. The JSON backend has no
-        generation concept: last-writer-wins, unchanged.
+        invisible to a concurrent full-save CAS. The writer token is
+        required and validated in the writing transaction: both
+        ``expected_generation`` and ``expected_incarnation`` must match the
+        live row + non-retired authority. A missing row raises
+        ``DeletedSessionWriteError``; a None token half, a retired/absent
+        authority, or either mismatch raises ``StaleSessionWriteError``
+        (fail closed — never a lenient unversioned write). The returned row
+        carries both ``generation`` (post-bump) and ``incarnation`` so the
+        caller can reseat its lineage.
+        The JSON backend has no generation concept: it accepts and ignores
+        the token kwargs — last-writer-wins, unchanged.
         """
         ...
 
@@ -179,7 +205,17 @@ class SessionStore(Protocol):
         """
         ...
 
-    def archive(self, sid: str, archived: bool = True) -> dict[str, Any]:
+    def archive(
+        self,
+        sid: str,
+        archived: bool = True,
+        *,
+        expected_generation: int | None = None,
+        expected_incarnation: int | None = None,
+    ) -> dict[str, Any]:
+        """Set the archived flag via ``update_metadata`` — the writer-token
+        requirement is inherited (SQL backends require both halves; JSON
+        accepts and ignores them)."""
         ...
 
     def session_exists(self, sid: str) -> bool:

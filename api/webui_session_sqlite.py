@@ -543,8 +543,17 @@ class WebUISqliteSessionDB:
     def read_session(self, sid: str) -> dict[str, Any] | None:
         if not _is_safe_session_id(sid):
             return None
+        # One PK-indexed LEFT JOIN against the incarnation authority so the
+        # loaded content and its (generation, incarnation) writer token are a
+        # single atomic read. LEFT (not INNER): a missing authority row must
+        # never hide a session from reads — it yields incarnation=None and
+        # every write path then fails closed.
         row = self._conn().execute(
-            "SELECT * FROM sessions WHERE session_id = ?", (sid,)
+            "SELECT s.*, i.incarnation AS incarnation "
+            "FROM sessions s "
+            "LEFT JOIN session_incarnations i ON i.session_id = s.session_id "
+            "WHERE s.session_id = ?",
+            (sid,),
         ).fetchone()
         if row is None:
             return None
@@ -567,7 +576,11 @@ class WebUISqliteSessionDB:
         if not _is_safe_session_id(sid):
             return None
         row = self._conn().execute(
-            "SELECT * FROM sessions WHERE session_id = ?", (sid,)
+            "SELECT s.*, i.incarnation AS incarnation "
+            "FROM sessions s "
+            "LEFT JOIN session_incarnations i ON i.session_id = s.session_id "
+            "WHERE s.session_id = ?",
+            (sid,),
         ).fetchone()
         if row is None:
             return None
@@ -606,6 +619,7 @@ class WebUISqliteSessionDB:
         session: dict[str, Any],
         *,
         expected_generation: int | None = None,
+        expected_incarnation: int | None = None,
         force: bool = False,
         fresh_incarnation: bool = False,
     ) -> dict[str, Any]:
@@ -630,7 +644,9 @@ class WebUISqliteSessionDB:
             self._bump_revision(conn)
             self._write_session_row(
                 conn, sid, payload,
-                expected_generation=expected_generation, force=force,
+                expected_generation=expected_generation,
+                expected_incarnation=expected_incarnation,
+                force=force,
                 fresh_incarnation=fresh_incarnation,
             )
             self._write_messages(conn, sid, messages)
@@ -710,7 +726,14 @@ class WebUISqliteSessionDB:
             values.append(fields["updated_at"])
         return set_parts, values
 
-    def update_metadata(self, sid: str, fields: dict[str, Any]) -> dict[str, Any]:
+    def update_metadata(
+        self,
+        sid: str,
+        fields: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+        expected_incarnation: int | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(fields, dict):
             raise TypeError("fields must be a dict")
         unsafe = set(fields) & self._METADATA_UNSAFE_FIELDS
@@ -719,17 +742,80 @@ class WebUISqliteSessionDB:
 
         conn = self._conn()
         with conn:
+            # The metadata write is a versioned writer: both halves of the
+            # (generation, incarnation) token are required and validated in
+            # the same transaction that applies the fields. Field validation
+            # above stays token-free (TypeError/ValueError before any SQL).
+            row = conn.execute(
+                "SELECT s.generation AS generation, i.incarnation AS incarnation, "
+                "i.retired AS retired "
+                "FROM sessions s "
+                "LEFT JOIN session_incarnations i ON i.session_id = s.session_id "
+                "WHERE s.session_id = ?",
+                (sid,),
+            ).fetchone()
+            if row is None:
+                raise DeletedSessionWriteError(
+                    f"Refusing metadata write for session {sid!r}: no live row "
+                    f"(deleted or never persisted)"
+                )
+            current_generation = int(row["generation"] or 0)
+            persisted_incarnation = (
+                int(row["incarnation"]) if row["incarnation"] is not None else None
+            )
+            if expected_generation is None or expected_incarnation is None:
+                raise StaleSessionWriteError(
+                    f"Refusing metadata write for session {sid!r}: unversioned "
+                    f"metadata write refused: load the durable version first"
+                )
+            if persisted_incarnation is None or int(row["retired"] or 0):
+                raise StaleSessionWriteError(
+                    f"Refusing metadata write for session {sid!r}: incarnation "
+                    f"authority is missing or retired (failing closed)"
+                )
+            if int(expected_generation) != current_generation:
+                raise StaleSessionWriteError(
+                    f"Refusing metadata write for session {sid!r}: expected "
+                    f"generation {expected_generation!r} != persisted "
+                    f"{current_generation!r} (stale writer; reload)"
+                )
+            if int(expected_incarnation) != persisted_incarnation:
+                raise StaleSessionWriteError(
+                    f"Refusing metadata write for session {sid!r}: expected "
+                    f"incarnation {expected_incarnation!r} != persisted "
+                    f"{persisted_incarnation!r}; the session was deleted and "
+                    f"recreated — reload"
+                )
             self._bump_revision(conn)
             set_parts, values = self._apply_metadata_fields(conn, sid, fields)
             # Metadata-only writers move the same version fence as full
             # writes, so a concurrent full-save CAS can never silently roll
-            # a metadata write back.
+            # a metadata write back. The guard enforces the fence in the
+            # statement itself (a fresh statement snapshot must not be able
+            # to see a newer row than the probe above).
             set_parts.append("generation = generation + 1")
-            values.append(sid)
-            conn.execute(
-                f"UPDATE sessions SET {', '.join(set_parts)} WHERE session_id = ?",
+            values.extend([sid, int(expected_generation), int(expected_incarnation)])
+            cur = conn.execute(
+                f"UPDATE sessions SET {', '.join(set_parts)} "
+                "WHERE session_id = ? AND generation = ? "
+                "AND EXISTS (SELECT 1 FROM session_incarnations i "
+                "WHERE i.session_id = sessions.session_id "
+                "AND i.incarnation = ? AND i.retired = 0)",
                 values,
             )
+            if cur.rowcount != 1:
+                probe = conn.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ?", (sid,)
+                ).fetchone()
+                if probe is None:
+                    raise DeletedSessionWriteError(
+                        f"Refusing metadata write for session {sid!r}: the row "
+                        f"disappeared under the write (deleted)"
+                    )
+                raise StaleSessionWriteError(
+                    f"Refusing metadata write for session {sid!r}: "
+                    f"generation/incarnation moved under the write; reload"
+                )
         return self._metadata_row(sid)
 
     def read_row_version(self, sid: str) -> dict[str, int] | None:
@@ -795,10 +881,13 @@ class WebUISqliteSessionDB:
             self._bump_revision(conn)
             set_parts, values = self._apply_metadata_fields(conn, sid, fields)
             set_parts.append("generation = generation + 1")
-            values.extend([sid, int(expected_generation)])
+            values.extend([sid, int(expected_generation), int(expected_incarnation)])
             cur = conn.execute(
                 f"UPDATE sessions SET {', '.join(set_parts)} "
-                "WHERE session_id = ? AND generation = ?",
+                "WHERE session_id = ? AND generation = ? "
+                "AND EXISTS (SELECT 1 FROM session_incarnations i "
+                "WHERE i.session_id = sessions.session_id "
+                "AND i.incarnation = ? AND i.retired = 0)",
                 values,
             )
             if cur.rowcount != 1:
@@ -891,8 +980,22 @@ class WebUISqliteSessionDB:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def archive(self, sid: str, archived: bool = True) -> dict[str, Any]:
-        return self.update_metadata(sid, {"archived": bool(archived)})
+    def archive(
+        self,
+        sid: str,
+        archived: bool = True,
+        *,
+        expected_generation: int | None = None,
+        expected_incarnation: int | None = None,
+    ) -> dict[str, Any]:
+        # Pass-through: strictness is inherited from update_metadata, so any
+        # caller must be a versioned writer carrying both token halves.
+        return self.update_metadata(
+            sid,
+            {"archived": bool(archived)},
+            expected_generation=expected_generation,
+            expected_incarnation=expected_incarnation,
+        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -905,6 +1008,7 @@ class WebUISqliteSessionDB:
         payload: dict[str, Any],
         *,
         expected_generation: int | None = None,
+        expected_incarnation: int | None = None,
         force: bool = False,
         fresh_incarnation: bool = False,
     ) -> None:
@@ -937,6 +1041,11 @@ class WebUISqliteSessionDB:
         consumed = set(_SESSION_SCALAR_FIELDS) | {
             "session_id",
             "anchor_activity_scenes",
+            # Store-owned fence values ride the authority/column, never the
+            # forward-compat bag — a stale bag copy would launder an old
+            # token into reads when the authority JOIN misses.
+            "generation",
+            "incarnation",
         }
         extra = {k: v for k, v in payload.items() if k not in consumed}
         cols.append("extra_json")
@@ -947,17 +1056,25 @@ class WebUISqliteSessionDB:
         cols.append("null_fields_json")
         vals.append(_json_dump(null_fields) if null_fields else None)
 
-        # Stale-writer fence: a durable per-session generation compared and
-        # bumped atomically, backed by the per-SID incarnation authority so a
-        # delete is not forgetful. updated_at cannot fence real stale Session
+        # Stale-writer fence: the writer token is the (incarnation,
+        # generation) pair — a durable per-session generation compared and
+        # bumped atomically, backed by the per-SID incarnation authority so
+        # a delete + same-SID recreate (which restarts the generation at 1)
+        # is still discriminated. updated_at cannot fence real stale Session
         # objects — save() stamps time.time() before writing — so writers
-        # must carry the generation their object was loaded with.
+        # must carry the token their object was loaded with.
         # Live row:
-        #   - force: deliberate heal/import — bump and overwrite.
-        #   - expected_generation == row generation: bump and overwrite.
-        #   - anything else (stale or lineage-unknown): refuse loudly.
+        #   - force: deliberate heal/import — bump and overwrite (never
+        #     consults the authority).
+        #   - expected_generation == row generation AND
+        #     expected_incarnation == authority incarnation (present,
+        #     non-retired): bump and overwrite.
+        #   - anything else (stale, lineage-unknown, or a pre-delete token
+        #     at an equal generation across a recreate): refuse loudly.
         # Absent row (force NEVER inserts; fresh_incarnation is the only
-        # lease, reserved for an explicit recreate API):
+        # lease, reserved for an explicit recreate API; expected_incarnation
+        # is ignored there — generation lineage + the retired authority
+        # already discriminate):
         #   - no authority + expected_generation None: first create
         #     (authority (sid, 1, 0, 0) + row generation 1).
         #   - no authority + expected_generation set: DeletedSessionWriteError.
@@ -969,9 +1086,15 @@ class WebUISqliteSessionDB:
         #     retired=0, row generation 1.
         #   - authority not retired but row absent (orphan): fail closed.
         row = conn.execute(
-            "SELECT generation FROM sessions WHERE session_id = ?", (sid,)
+            "SELECT s.generation AS generation, i.incarnation AS incarnation, "
+            "i.retired AS retired "
+            "FROM sessions s "
+            "LEFT JOIN session_incarnations i ON i.session_id = s.session_id "
+            "WHERE s.session_id = ?",
+            (sid,),
         ).fetchone()
         current_generation = int(row["generation"] or 0) if row is not None else None
+        cas_guard = False
         if current_generation is not None:
             if force:
                 new_generation = current_generation + 1
@@ -983,7 +1106,23 @@ class WebUISqliteSessionDB:
                     f"deliberate heals)"
                 )
             else:
+                persisted_incarnation = (
+                    int(row["incarnation"]) if row["incarnation"] is not None else None
+                )
+                if (
+                    expected_incarnation is None
+                    or persisted_incarnation is None
+                    or int(row["retired"] or 0)
+                    or int(expected_incarnation) != persisted_incarnation
+                ):
+                    raise StaleSessionWriteError(
+                        f"Refusing to overwrite session {sid!r}: expected "
+                        f"incarnation {expected_incarnation!r} != persisted "
+                        f"{persisted_incarnation!r}; the session was deleted "
+                        f"and recreated — reload"
+                    )
                 new_generation = current_generation + 1
+                cas_guard = True
         else:
             authority = conn.execute(
                 "SELECT incarnation, retired FROM session_incarnations "
@@ -1039,12 +1178,44 @@ class WebUISqliteSessionDB:
         vals.append(new_generation)
 
         placeholders = ", ".join("?" for _ in cols)
-        conn.execute(
+        upsert_sql = (
             f"INSERT INTO sessions ({', '.join(cols)}) VALUES ({placeholders}) "
             "ON CONFLICT(session_id) DO UPDATE SET "
-            + ", ".join(f"{c}=excluded.{c}" for c in cols),
-            vals,
+            + ", ".join(f"{c}=excluded.{c}" for c in cols)
         )
+        if cas_guard:
+            # Enforce the fence in the statement itself, not only in the
+            # probe above: a backend whose statements see a fresh snapshot
+            # (Postgres READ COMMITTED) must still refuse a row that moved
+            # between the SELECT and this upsert. On SQLite the window is
+            # already closed (the write transaction is open before the
+            # probe), so this is one shared proof obligation.
+            cur = conn.execute(
+                upsert_sql
+                + " WHERE sessions.generation = ? "
+                  "AND EXISTS (SELECT 1 FROM session_incarnations i "
+                  "WHERE i.session_id = sessions.session_id "
+                  "AND i.incarnation = ? AND i.retired = 0)",
+                vals + [int(expected_generation), int(expected_incarnation)],
+            )
+            if cur.rowcount != 1:
+                probe = conn.execute(
+                    "SELECT s.generation AS generation, "
+                    "i.incarnation AS incarnation "
+                    "FROM sessions s "
+                    "LEFT JOIN session_incarnations i "
+                    "ON i.session_id = s.session_id "
+                    "WHERE s.session_id = ?",
+                    (sid,),
+                ).fetchone()
+                raise StaleSessionWriteError(
+                    f"Refusing to overwrite session {sid!r}: "
+                    f"generation/incarnation moved under the write "
+                    f"(persisted: {dict(probe) if probe is not None else None!r}); "
+                    f"reload and retry"
+                )
+        else:
+            conn.execute(upsert_sql, vals)
 
     def _write_messages(self, conn: sqlite3.Connection, sid: str, messages: list[Any]) -> None:
         conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
@@ -1125,10 +1296,18 @@ class WebUISqliteSessionDB:
                         row[k] = None
         if d.get("generation") is not None:
             row["generation"] = d["generation"]
+        if d.get("incarnation") is not None:
+            row["incarnation"] = d["incarnation"]
         return row
 
     def _metadata_row(self, sid: str) -> dict[str, Any]:
-        row = self._conn().execute("SELECT * FROM sessions WHERE session_id = ?", (sid,)).fetchone()
+        row = self._conn().execute(
+            "SELECT s.*, i.incarnation AS incarnation "
+            "FROM sessions s "
+            "LEFT JOIN session_incarnations i ON i.session_id = s.session_id "
+            "WHERE s.session_id = ?",
+            (sid,),
+        ).fetchone()
         if row is None:
             raise KeyError(sid)
         return self._row_to_metadata(dict(row))

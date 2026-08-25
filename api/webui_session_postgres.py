@@ -318,8 +318,17 @@ class WebUIPostgresSessionDB:
         return row is not None
 
     def _fetch_row(self, sid: str) -> dict[str, Any] | None:
+        # One PK-indexed LEFT JOIN against the incarnation authority so the
+        # loaded content and its (generation, incarnation) writer token are a
+        # single atomic read. LEFT (not INNER): a missing authority row must
+        # never hide a session from reads — it yields incarnation=None and
+        # every write path then fails closed.
         cur = self._conn().execute(
-            "SELECT * FROM sessions WHERE session_id = %s", (sid,)
+            "SELECT s.*, i.incarnation AS incarnation "
+            "FROM sessions s "
+            "LEFT JOIN session_incarnations i ON i.session_id = s.session_id "
+            "WHERE s.session_id = %s",
+            (sid,),
         )
         row = cur.fetchone()
         if row is None:
@@ -360,6 +369,7 @@ class WebUIPostgresSessionDB:
         session: dict[str, Any],
         *,
         expected_generation: int | None = None,
+        expected_incarnation: int | None = None,
         force: bool = False,
         fresh_incarnation: bool = False,
     ) -> dict[str, Any]:
@@ -383,7 +393,9 @@ class WebUIPostgresSessionDB:
             self._bump_revision(conn)
             self._write_session_row(
                 conn, sid, payload,
-                expected_generation=expected_generation, force=force,
+                expected_generation=expected_generation,
+                expected_incarnation=expected_incarnation,
+                force=force,
                 fresh_incarnation=fresh_incarnation,
             )
             self._write_json_table(conn, "messages", "message_json", sid, messages)
@@ -399,6 +411,7 @@ class WebUIPostgresSessionDB:
         payload: dict[str, Any],
         *,
         expected_generation: int | None = None,
+        expected_incarnation: int | None = None,
         force: bool = False,
         fresh_incarnation: bool = False,
     ) -> None:
@@ -425,7 +438,12 @@ class WebUIPostgresSessionDB:
         cols.append("anchor_activity_scenes_json")
         scenes = payload.get("anchor_activity_scenes")
         vals.append(_json_dump(scenes) if scenes is not None else None)
-        consumed = set(_SESSION_SCALAR_FIELDS) | {"session_id", "anchor_activity_scenes"}
+        consumed = set(_SESSION_SCALAR_FIELDS) | {
+            "session_id", "anchor_activity_scenes",
+            # Store-owned fence values ride the authority/column, never the
+            # forward-compat bag.
+            "generation", "incarnation",
+        }
         extra = {k: v for k, v in payload.items() if k not in consumed}
         cols.append("extra_json")
         vals.append(_json_dump(extra) if extra else None)
@@ -434,14 +452,23 @@ class WebUIPostgresSessionDB:
         cols.append("null_fields_json")
         vals.append(_json_dump(null_fields) if null_fields else None)
 
-        # Same decision table as the SQLite store: live rows CAS on the
-        # durable generation; absent rows consult the incarnation authority.
+        # Same decision table as the SQLite store: the writer token is the
+        # (incarnation, generation) pair — live rows CAS on both against the
+        # JOINed authority; absent rows consult the incarnation authority.
         # force may overwrite a LIVE row only — it never inserts an absent
         # one; fresh_incarnation is the only lease onto a retired SID.
+        # expected_incarnation is ignored on the absent-row branch (the
+        # generation lineage + retired authority already discriminate).
         row = conn.execute(
-            "SELECT generation FROM sessions WHERE session_id = %s", (sid,)
+            "SELECT s.generation AS generation, i.incarnation AS incarnation, "
+            "i.retired AS retired "
+            "FROM sessions s "
+            "LEFT JOIN session_incarnations i ON i.session_id = s.session_id "
+            "WHERE s.session_id = %s",
+            (sid,),
         ).fetchone()
         current_generation = int(row[0] or 0) if row is not None else None
+        cas_guard = False
         if current_generation is not None:
             if force:
                 new_generation = current_generation + 1
@@ -453,7 +480,21 @@ class WebUIPostgresSessionDB:
                     f"deliberate heals)"
                 )
             else:
+                persisted_incarnation = int(row[1]) if row[1] is not None else None
+                if (
+                    expected_incarnation is None
+                    or persisted_incarnation is None
+                    or int(row[2] or 0)
+                    or int(expected_incarnation) != persisted_incarnation
+                ):
+                    raise StaleSessionWriteError(
+                        f"Refusing to overwrite session {sid!r}: expected "
+                        f"incarnation {expected_incarnation!r} != persisted "
+                        f"{persisted_incarnation!r}; the session was deleted "
+                        f"and recreated — reload"
+                    )
                 new_generation = current_generation + 1
+                cas_guard = True
         else:
             authority = conn.execute(
                 "SELECT incarnation, retired FROM session_incarnations "
@@ -505,12 +546,42 @@ class WebUIPostgresSessionDB:
         vals.append(new_generation)
 
         placeholders = ", ".join("%s" for _ in cols)
-        conn.execute(
+        upsert_sql = (
             f"INSERT INTO sessions ({', '.join(cols)}) VALUES ({placeholders}) "
             "ON CONFLICT(session_id) DO UPDATE SET "
-            + ", ".join(f"{c}=excluded.{c}" for c in cols),
-            vals,
+            + ", ".join(f"{c}=excluded.{c}" for c in cols)
         )
+        if cas_guard:
+            # Enforce the fence in the statement itself: Postgres READ
+            # COMMITTED gives each statement a fresh snapshot, so a
+            # SELECT-then-UPDATE inside one transaction could otherwise see
+            # a newer row than the probe above.
+            cur = conn.execute(
+                upsert_sql
+                + " WHERE sessions.generation = %s "
+                  "AND EXISTS (SELECT 1 FROM session_incarnations i "
+                  "WHERE i.session_id = sessions.session_id "
+                  "AND i.incarnation = %s AND i.retired = 0)",
+                vals + [int(expected_generation), int(expected_incarnation)],
+            )
+            if cur.rowcount != 1:
+                probe = conn.execute(
+                    "SELECT s.generation AS generation, "
+                    "i.incarnation AS incarnation "
+                    "FROM sessions s "
+                    "LEFT JOIN session_incarnations i "
+                    "ON i.session_id = s.session_id "
+                    "WHERE s.session_id = %s",
+                    (sid,),
+                ).fetchone()
+                raise StaleSessionWriteError(
+                    f"Refusing to overwrite session {sid!r}: "
+                    f"generation/incarnation moved under the write "
+                    f"(persisted: {tuple(probe) if probe is not None else None!r}); "
+                    f"reload and retry"
+                )
+        else:
+            conn.execute(upsert_sql, vals)
 
     def _write_json_table(self, conn, table: str, column: str, sid: str, rows: list[Any]) -> None:
         conn.execute(f"DELETE FROM {table} WHERE session_id = %s", (sid,))
@@ -594,7 +665,14 @@ class WebUIPostgresSessionDB:
             values.append(_json_dump(current))
         return set_parts, values
 
-    def update_metadata(self, sid: str, fields: dict[str, Any]) -> dict[str, Any]:
+    def update_metadata(
+        self,
+        sid: str,
+        fields: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+        expected_incarnation: int | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(fields, dict):
             raise TypeError("fields must be a dict")
         unsafe = set(fields) & self._METADATA_UNSAFE_FIELDS
@@ -603,16 +681,77 @@ class WebUIPostgresSessionDB:
 
         conn = self._conn()
         with conn:
+            # The metadata write is a versioned writer: both halves of the
+            # (generation, incarnation) token are required and validated in
+            # the same transaction that applies the fields. Field validation
+            # above stays token-free (TypeError/ValueError before any SQL).
+            row = conn.execute(
+                "SELECT s.generation AS generation, i.incarnation AS incarnation, "
+                "i.retired AS retired "
+                "FROM sessions s "
+                "LEFT JOIN session_incarnations i ON i.session_id = s.session_id "
+                "WHERE s.session_id = %s",
+                (sid,),
+            ).fetchone()
+            if row is None:
+                raise DeletedSessionWriteError(
+                    f"Refusing metadata write for session {sid!r}: no live row "
+                    f"(deleted or never persisted)"
+                )
+            current_generation = int(row[0] or 0)
+            persisted_incarnation = int(row[1]) if row[1] is not None else None
+            if expected_generation is None or expected_incarnation is None:
+                raise StaleSessionWriteError(
+                    f"Refusing metadata write for session {sid!r}: unversioned "
+                    f"metadata write refused: load the durable version first"
+                )
+            if persisted_incarnation is None or int(row[2] or 0):
+                raise StaleSessionWriteError(
+                    f"Refusing metadata write for session {sid!r}: incarnation "
+                    f"authority is missing or retired (failing closed)"
+                )
+            if int(expected_generation) != current_generation:
+                raise StaleSessionWriteError(
+                    f"Refusing metadata write for session {sid!r}: expected "
+                    f"generation {expected_generation!r} != persisted "
+                    f"{current_generation!r} (stale writer; reload)"
+                )
+            if int(expected_incarnation) != persisted_incarnation:
+                raise StaleSessionWriteError(
+                    f"Refusing metadata write for session {sid!r}: expected "
+                    f"incarnation {expected_incarnation!r} != persisted "
+                    f"{persisted_incarnation!r}; the session was deleted and "
+                    f"recreated — reload"
+                )
             self._bump_revision(conn)
             set_parts, values = self._apply_metadata_fields(conn, sid, fields)
             # Metadata-only writers move the same version fence as full
             # writes (generation is never in fields, so appending is safe).
+            # The guard enforces the fence in the statement itself (a fresh
+            # statement snapshot must not see a newer row than the probe).
             set_parts.append("generation = generation + 1")
-            values.append(sid)
-            conn.execute(
-                f"UPDATE sessions SET {', '.join(set_parts)} WHERE session_id = %s",
+            values.extend([sid, int(expected_generation), int(expected_incarnation)])
+            cur = conn.execute(
+                f"UPDATE sessions SET {', '.join(set_parts)} "
+                "WHERE session_id = %s AND generation = %s "
+                "AND EXISTS (SELECT 1 FROM session_incarnations i "
+                "WHERE i.session_id = sessions.session_id "
+                "AND i.incarnation = %s AND i.retired = 0)",
                 values,
             )
+            if cur.rowcount != 1:
+                probe = conn.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = %s", (sid,)
+                ).fetchone()
+                if probe is None:
+                    raise DeletedSessionWriteError(
+                        f"Refusing metadata write for session {sid!r}: the row "
+                        f"disappeared under the write (deleted)"
+                    )
+                raise StaleSessionWriteError(
+                    f"Refusing metadata write for session {sid!r}: "
+                    f"generation/incarnation moved under the write; reload"
+                )
         return self.read_metadata_only(sid) or {}
 
     def read_row_version(self, sid: str) -> dict[str, int] | None:
@@ -675,10 +814,13 @@ class WebUIPostgresSessionDB:
             self._bump_revision(conn)
             set_parts, values = self._apply_metadata_fields(conn, sid, fields)
             set_parts.append("generation = generation + 1")
-            values.extend([sid, int(expected_generation)])
+            values.extend([sid, int(expected_generation), int(expected_incarnation)])
             cur = conn.execute(
                 f"UPDATE sessions SET {', '.join(set_parts)} "
-                "WHERE session_id = %s AND generation = %s",
+                "WHERE session_id = %s AND generation = %s "
+                "AND EXISTS (SELECT 1 FROM session_incarnations i "
+                "WHERE i.session_id = sessions.session_id "
+                "AND i.incarnation = %s AND i.retired = 0)",
                 values,
             )
             if cur.rowcount != 1:
@@ -764,8 +906,22 @@ class WebUIPostgresSessionDB:
         cols = [d.name if hasattr(d, "name") else d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-    def archive(self, sid: str, archived: bool = True) -> dict[str, Any]:
-        return self.update_metadata(sid, {"archived": 1 if archived else 0})
+    def archive(
+        self,
+        sid: str,
+        archived: bool = True,
+        *,
+        expected_generation: int | None = None,
+        expected_incarnation: int | None = None,
+    ) -> dict[str, Any]:
+        # Pass-through: strictness is inherited from update_metadata, so any
+        # caller must be a versioned writer carrying both token halves.
+        return self.update_metadata(
+            sid,
+            {"archived": 1 if archived else 0},
+            expected_generation=expected_generation,
+            expected_incarnation=expected_incarnation,
+        )
 
     # -- row mapping (mirrors the SQLite store) ----------------------------
 
@@ -805,6 +961,8 @@ class WebUIPostgresSessionDB:
                         row[k] = None
         if d.get("generation") is not None:
             row["generation"] = d["generation"]
+        if d.get("incarnation") is not None:
+            row["incarnation"] = d["incarnation"]
         return row
 
     def _row_to_session(self, d: dict[str, Any]) -> dict[str, Any]:

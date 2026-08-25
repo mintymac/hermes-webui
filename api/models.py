@@ -1322,7 +1322,7 @@ _RECONCILE_BASELINE_EXCLUDED_KEYS = {
     "anchor_activity_scenes",           # transcript-derived; never a metadata overlay axis
     "anchor_scene_index", "anchor_scene_index_hash",  # computed at write time
     "message_count", "last_message_at",                # computed
-    "generation",                        # owned by the store fence, never by metadata
+    "generation", "incarnation",         # owned by the store fence, never by metadata
 }
 
 
@@ -1379,7 +1379,20 @@ def _demote_marked_if_recovered(store, sid: str):
             if sc.exists():
                 live = json.loads(sc.read_text(encoding='utf-8')).get('composer_draft')
                 if live != at_mark_draft:
-                    _carry = store.update_metadata(sid, {"composer_draft": live})
+                    # The probe (read_session) carries the durable
+                    # (generation, incarnation) token: fence the carry with
+                    # it so an interleaved writer between probe and carry
+                    # raises instead of being silently clobbered (the
+                    # except below keeps the mark for retry). No token →
+                    # fail closed: skip the carry, keep the mark.
+                    if data.get("incarnation") is None:
+                        return None
+                    _carry = store.update_metadata(
+                        sid,
+                        {"composer_draft": live},
+                        expected_generation=int(data["generation"]),
+                        expected_incarnation=int(data["incarnation"]),
+                    )
                     data['composer_draft'] = live
                     # The carry bumps the generation fence (metadata writers
                     # move it too): refresh the probe so the demoted load
@@ -1698,13 +1711,17 @@ class Session:
             'model_explicit_pick_signature', 'is_cli_session', 'source_tag',
             'raw_source', 'session_source', 'source_label', 'read_only',
             'anchor_scene_index', 'message_count', 'extra_session_fields',
-            'generation',
+            'generation', 'incarnation',
         }
-        # Durable CAS generation: the generation the persisted row had when
-        # this object was loaded. save() passes it to write_session, which
-        # compares-and-bumps atomically; a stale object loaded before a newer
-        # writer is refused instead of silently rolling the session back.
+        # Durable CAS writer token: the (generation, incarnation) the
+        # persisted row had when this object was loaded. save() passes both
+        # to write_session, which compares-and-bumps atomically; a stale
+        # object loaded before a newer writer — or before a delete +
+        # same-SID recreate (generation restarts at 1, so generation alone
+        # cannot discriminate it) — is refused instead of silently rolling
+        # the session back.
         self._persisted_generation = kwargs.get('generation')
+        self._persisted_incarnation = kwargs.get('incarnation')
         _bag = kwargs.get('extra_session_fields')
         self.extra_session_fields = dict(_bag) if isinstance(_bag, dict) else {}
         for _k, _v in kwargs.items():
@@ -1754,20 +1771,52 @@ class Session:
                 and self.session_id not in store.unreadable_sids
                 and store.session_exists(self.session_id)
             ):
-                # Persist first; apply in-memory only after the write succeeds.
-                # A failed write must leave the cached Session matching what is
-                # actually persisted — otherwise the draft route's unchanged
-                # fast path sees the requested value already in memory and skips
-                # the retry, losing the draft after the next reload.
-                _result = store.update_metadata(self.session_id, fields)
-                # update_metadata moves the generation fence: reseat the
-                # persisted lineage from the returned row so this (cached,
-                # per-sid) object's next full save() still passes the CAS.
-                if isinstance(_result, dict) and _result.get("generation") is not None:
-                    self._persisted_generation = int(_result["generation"])
-                for k, v in fields.items():
-                    setattr(self, k, v)
-                return
+                # The metadata write is a versioned writer: fence it with the
+                # durable (generation, incarnation) token. Normally that is
+                # the load-time token this owner carries. A sidecar-loaded
+                # owner carries no token; with the row healthy and unmarked
+                # (e.g. right after a demote popped the mark) routing its
+                # write to the sidecar would strand it — the next load reads
+                # the row — so take the durable token fresh inside this
+                # locked region and let the store's guarded CAS fence the
+                # write. Only the caller's explicit fields are applied, so no
+                # owner-held state is laundered into a representation it did
+                # not load from; a concurrent writer between the token read
+                # and the write is refused by the store (fail closed). A
+                # vanished/retired row yields no token and falls through to
+                # the sidecar branch.
+                _gen = getattr(self, "_persisted_generation", None)
+                _inc = getattr(self, "_persisted_incarnation", None)
+                if _gen is None or _inc is None:
+                    try:
+                        _ver = store.read_row_version(self.session_id)
+                    except Exception:
+                        _ver = None
+                    if _ver is not None:
+                        _gen = _ver.get("generation")
+                        _inc = _ver.get("incarnation")
+                if _gen is not None and _inc is not None:
+                    # Persist first; apply in-memory only after the write succeeds.
+                    # A failed write must leave the cached Session matching what is
+                    # actually persisted — otherwise the draft route's unchanged
+                    # fast path sees the requested value already in memory and skips
+                    # the retry, losing the draft after the next reload.
+                    _result = store.update_metadata(
+                        self.session_id,
+                        fields,
+                        expected_generation=int(_gen),
+                        expected_incarnation=int(_inc),
+                    )
+                    # update_metadata moves the generation fence: reseat the
+                    # persisted lineage from the returned row so this (cached,
+                    # per-sid) object's next full save() still passes the CAS.
+                    if isinstance(_result, dict) and _result.get("generation") is not None:
+                        self._persisted_generation = int(_result["generation"])
+                    if isinstance(_result, dict) and _result.get("incarnation") is not None:
+                        self._persisted_incarnation = int(_result["incarnation"])
+                    for k, v in fields.items():
+                        setattr(self, k, v)
+                    return
             # JSON fallback: read, update, write back.
             data = json.loads(self.path.read_text(encoding="utf-8"))
             data.update(fields)
@@ -1949,11 +1998,14 @@ class Session:
                     _write_result = store.write_session(
                         payload,
                         expected_generation=getattr(self, "_persisted_generation", None),
+                        expected_incarnation=getattr(self, "_persisted_incarnation", None),
                         force=False,
                     )
                     store.unreadable_sids.pop(self.session_id, None)
                 if isinstance(_write_result, dict) and _write_result.get("generation") is not None:
                     self._persisted_generation = _write_result["generation"]
+                if isinstance(_write_result, dict) and _write_result.get("incarnation") is not None:
+                    self._persisted_incarnation = int(_write_result["incarnation"])
                 if not skip_index:
                     _write_session_index(updates=[self])
                 return
@@ -6377,13 +6429,28 @@ def persist_recovered_workspace_binding(
             ) from exc
         current = str(meta.get("workspace") or "")
         _new_generation = None
+        _new_incarnation = None
         if current != resolved:
             if current != expected:
                 raise WorkspaceBindingPersistenceError(
                     "Failed to persist recovered workspace: session workspace changed"
                 )
+            # Fence the compare-and-replace with the durable
+            # (generation, incarnation) token just read: an interleaved
+            # writer between the read and this write raises (wrapped below)
+            # instead of being silently clobbered. The JSON sidecar store
+            # carries no durable version, so no token is passed there
+            # (last-writer-wins, unchanged).
+            _token_kwargs = {}
+            if meta.get("generation") is not None and meta.get("incarnation") is not None:
+                _token_kwargs = {
+                    "expected_generation": int(meta["generation"]),
+                    "expected_incarnation": int(meta["incarnation"]),
+                }
             try:
-                _meta_result = store.update_metadata(sid, {"workspace": resolved})
+                _meta_result = store.update_metadata(
+                    sid, {"workspace": resolved}, **_token_kwargs
+                )
             except Exception as exc:
                 raise WorkspaceBindingPersistenceError(
                     "Failed to persist recovered workspace"
@@ -6393,16 +6460,22 @@ def persist_recovered_workspace_binding(
             # session so a later full save() still passes the CAS.
             if isinstance(_meta_result, dict) and _meta_result.get("generation") is not None:
                 _new_generation = int(_meta_result["generation"])
+            if isinstance(_meta_result, dict) and _meta_result.get("incarnation") is not None:
+                _new_incarnation = int(_meta_result["incarnation"])
 
         session.workspace = resolved
         if _new_generation is not None:
             session._persisted_generation = _new_generation
+        if _new_incarnation is not None:
+            session._persisted_incarnation = _new_incarnation
         with LOCK:
             cached = SESSIONS.get(sid)
             if cached is not None:
                 cached.workspace = resolved
                 if _new_generation is not None:
                     cached._persisted_generation = _new_generation
+                if _new_incarnation is not None:
+                    cached._persisted_incarnation = _new_incarnation
         try:
             _write_session_index(updates=[cached or session])
         except Exception:

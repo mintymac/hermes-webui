@@ -35,6 +35,16 @@ def _sample_session_dict(sid: str = "test-session") -> dict:
     }
 
 
+def _tok(store, sid: str) -> dict:
+    """The current durable (generation, incarnation) writer token for sid."""
+    ver = store.read_row_version(sid)
+    assert ver is not None, f"no live row for {sid}"
+    return {
+        "expected_generation": ver["generation"],
+        "expected_incarnation": ver["incarnation"],
+    }
+
+
 def test_sqlite_store_round_trip():
     d = _tmp_session_dir()
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
@@ -53,7 +63,9 @@ def test_sqlite_store_update_metadata():
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
     store.write_session(_sample_session_dict("sid-2"))
 
-    store.update_metadata("sid-2", {"composer_draft": {"text": "draft", "files": []}})
+    store.update_metadata(
+        "sid-2", {"composer_draft": {"text": "draft", "files": []}}, **_tok(store, "sid-2")
+    )
     loaded = store.read_session("sid-2")
     assert loaded["composer_draft"]["text"] == "draft"
     assert len(loaded["messages"]) == 2
@@ -94,7 +106,7 @@ def test_sqlite_round_trip_preserves_unknown_top_level_keys():
     assert loaded["future_feature_flag"] == {"enabled": True, "tier": 3}
     assert loaded["brand_new_scalar"] == "hello-future"
     # And via update_metadata merge.
-    store.update_metadata("sid-unknown", {"another_future_key": [1, 2]})
+    store.update_metadata("sid-unknown", {"another_future_key": [1, 2]}, **_tok(store, "sid-unknown"))
     assert store.read_session("sid-unknown")["another_future_key"] == [1, 2]
     assert store.read_session("sid-unknown")["brand_new_scalar"] == "hello-future"
 
@@ -147,7 +159,10 @@ def test_schema_v2_migration_adds_columns_to_legacy_db():
     assert loaded is not None
     assert loaded["title"] == "legacy"
 
-    store.update_metadata("s1", {"user_id": "u1", "new_stuff": {"x": 1}})
+    # The legacy v1 row was backfilled to incarnation 1 by the v5 authority
+    # seed; its generation is still 0, so the token exercises a
+    # generation-0 legacy row.
+    store.update_metadata("s1", {"user_id": "u1", "new_stuff": {"x": 1}}, **_tok(store, "s1"))
     reloaded = store.read_session("s1")
     assert reloaded["user_id"] == "u1"
     assert reloaded["new_stuff"] == {"x": 1}
@@ -209,13 +224,17 @@ def test_generation_cas_refuses_stale_writers():
     else:
         raise AssertionError("lineage-less overwrite must be refused")
 
-    # Matching lineage: compare-and-bump.
-    store.write_session(_sample_session_dict("sid-fence"), expected_generation=1)
+    # Matching lineage: compare-and-bump (the token is the pair).
+    store.write_session(
+        _sample_session_dict("sid-fence"), expected_generation=1, expected_incarnation=1
+    )
     assert store.read_session("sid-fence")["generation"] == 2
 
     # Stale lineage: refused.
     try:
-        store.write_session(_sample_session_dict("sid-fence"), expected_generation=1)
+        store.write_session(
+            _sample_session_dict("sid-fence"), expected_generation=1, expected_incarnation=1
+        )
     except sqlite_db.StaleSessionWriteError:
         pass
     else:
@@ -223,6 +242,18 @@ def test_generation_cas_refuses_stale_writers():
 
     # force bypasses for deliberate heals and bumps anyway.
     store.write_session(_sample_session_dict("sid-fence"), force=True)
+    assert store.read_session("sid-fence")["generation"] == 3
+
+    # Right generation + wrong incarnation: refused — the fence is the pair,
+    # not the generation alone.
+    try:
+        store.write_session(
+            _sample_session_dict("sid-fence"), expected_generation=3, expected_incarnation=9
+        )
+    except sqlite_db.StaleSessionWriteError:
+        pass
+    else:
+        raise AssertionError("right generation + wrong incarnation must be refused")
     assert store.read_session("sid-fence")["generation"] == 3
 
 
@@ -285,6 +316,12 @@ def test_explicit_same_id_recreation_requires_lease(monkeypatch):
 
     held = models.Session.load("sid-lease")
     assert held is not None
+    # A second owner stays at generation 1 / incarnation 1: the
+    # equal-generation ordinary-path leg below never advances it.
+    owner = models.Session.load("sid-lease")
+    assert owner is not None
+    assert owner._persisted_generation == 1
+    assert owner._persisted_incarnation == 1
     held.title = "advanced before delete"
     held.save()  # generation 2; held._persisted_generation == 2
 
@@ -299,7 +336,9 @@ def test_explicit_same_id_recreation_requires_lease(monkeypatch):
     assert store.session_exists("sid-lease") is False
 
     # Leased recreate: new incarnation, row starts at generation 1.
-    store.write_session(_sample_session_dict("sid-lease"), fresh_incarnation=True)
+    recreated = _sample_session_dict("sid-lease")
+    recreated["title"] = "recreated incarnation"
+    store.write_session(recreated, fresh_incarnation=True)
     loaded = store.read_session("sid-lease")
     assert loaded is not None
     assert loaded["generation"] == 1
@@ -310,11 +349,24 @@ def test_explicit_same_id_recreation_requires_lease(monkeypatch):
     assert row["incarnation"] == 2
     assert row["retired"] == 0
 
+    # Equal-generation stale writer: owner holds (generation 1, incarnation 1)
+    # and the recreated row is ALSO generation 1 — only the incarnation half
+    # of the token discriminates the old owner from the new incarnation.
+    owner.title = "stale equal-generation write"
+    with pytest.raises(sqlite_db.StaleSessionWriteError):
+        owner.save()
+    # The recreated incarnation's row is intact.
+    assert store.read_session("sid-lease")["title"] == "recreated incarnation"
+    assert store.read_row_version("sid-lease") == {"generation": 1, "incarnation": 2}
+    fresh = models.Session.load("sid-lease")
+    assert fresh is not None
+    assert fresh.title == "recreated incarnation"
+
     # A still-held pre-delete Session remains a stale writer across the lease.
     held.title = "stale pre-delete write"
     with pytest.raises(sqlite_db.StaleSessionWriteError):
         held.save()
-    assert store.read_session("sid-lease")["title"] == "Test Session"
+    assert store.read_session("sid-lease")["title"] == "recreated incarnation"
 
 
 def test_two_readers_stale_writer_is_rejected(monkeypatch):
@@ -373,7 +425,11 @@ def test_null_valued_keys_round_trip_with_presence(monkeypatch):
     assert "user_id" in loaded and loaded["user_id"] is None
 
     # update_metadata maintains presence in both directions.
-    store.update_metadata("sid-nulls", {"personality": "now-set", "threshold_tokens": None})
+    store.update_metadata(
+        "sid-nulls",
+        {"personality": "now-set", "threshold_tokens": None},
+        **_tok(store, "sid-nulls"),
+    )
     reloaded = store.read_session("sid-nulls")
     assert reloaded["personality"] == "now-set"
     assert "threshold_tokens" in reloaded and reloaded["threshold_tokens"] is None
@@ -753,7 +809,9 @@ def test_recovered_row_keeps_its_own_draft_on_demote(monkeypatch):
     sid = "sid-noclobber"
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
     store.write_session(_sample_session_dict(sid))
-    store.update_metadata(sid, {"composer_draft": {"text": "newer in sqlite", "files": []}})
+    store.update_metadata(
+        sid, {"composer_draft": {"text": "newer in sqlite", "files": []}}, **_tok(store, sid)
+    )
     sidecar_payload = _sample_session_dict(sid)
     sidecar_payload["composer_draft"] = {"text": "older in sidecar", "files": []}
     (d / f"{sid}.json").write_text(json.dumps(sidecar_payload), encoding="utf-8")
@@ -1048,7 +1106,7 @@ def test_marked_reconcile_fenced_against_concurrent_update_metadata(monkeypatch)
         row = real_read(sid_)
         if row is not None and not injected["done"]:
             injected["done"] = True
-            store.update_metadata(sid_, {"pinned": True})
+            store.update_metadata(sid_, {"pinned": True}, **_tok(store, sid_))
         return row
 
     monkeypatch.setattr(store, "read_session", inject_concurrent_write)
@@ -1216,7 +1274,7 @@ def test_save_metadata_reseats_generation_for_subsequent_save(monkeypatch):
     sid = "sid-reseat"
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
     store.write_session(_sample_session_dict(sid))  # generation 1
-    store.update_metadata(sid, {"title": "t2"})     # generation 2
+    store.update_metadata(sid, {"title": "t2"}, **_tok(store, sid))  # generation 2
     monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
 
     s = models.Session.load(sid)
@@ -1369,7 +1427,9 @@ def test_update_metadata_does_not_advance_updated_at_for_drafts():
     loaded = store.read_session("sid-draft")
     original_updated_at = loaded["updated_at"]
 
-    store.update_metadata("sid-draft", {"composer_draft": {"text": "draft", "files": []}})
+    store.update_metadata(
+        "sid-draft", {"composer_draft": {"text": "draft", "files": []}}, **_tok(store, "sid-draft")
+    )
 
     reloaded = store.read_session("sid-draft")
     assert reloaded["composer_draft"]["text"] == "draft"
@@ -1382,7 +1442,7 @@ def test_update_metadata_advances_updated_at_when_requested():
     store.write_session(_sample_session_dict("sid-touch"))
 
     new_time = 9999.0
-    store.update_metadata("sid-touch", {"updated_at": new_time})
+    store.update_metadata("sid-touch", {"updated_at": new_time}, **_tok(store, "sid-touch"))
 
     reloaded = store.read_session("sid-touch")
     assert reloaded["updated_at"] == new_time
@@ -1466,7 +1526,7 @@ def test_save_metadata_sqlite_write_failure_leaves_in_memory_untouched(monkeypat
     s = models.Session.load(sid)
     old_draft = dict(getattr(s, "composer_draft", {}) or {})
 
-    def _boom(sid_, fields):
+    def _boom(*args, **kwargs):
         raise _sq.OperationalError("database is locked")
 
     monkeypatch.setattr(store, "update_metadata", _boom)
@@ -1534,11 +1594,11 @@ def test_draft_route_retry_after_sqlite_write_failure_persists(monkeypatch):
     real_update = store.update_metadata
     calls = {"n": 0}
 
-    def fail_once(sid_, fields):
+    def fail_once(*args, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             raise _sq.OperationalError("database is locked")
-        return real_update(sid_, fields)
+        return real_update(*args, **kwargs)
 
     monkeypatch.setattr(store, "update_metadata", fail_once)
 

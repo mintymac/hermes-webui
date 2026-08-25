@@ -127,13 +127,23 @@ class WebUIJsonSessionDB:
             return None
         return copy.deepcopy(data)
 
-    def update_metadata(self, sid: str, fields: dict[str, Any]) -> dict[str, Any]:
+    def update_metadata(
+        self,
+        sid: str,
+        fields: dict[str, Any],
+        *,
+        expected_incarnation: int | None = None,
+    ) -> dict[str, Any]:
         """Persist metadata fields while preserving messages.
 
         Unknown top-level keys are accepted and persisted on the sidecar
         dict, matching the SQL backends' ``extra_json`` policy (one metadata
         policy across backends). Only ``_UNSAFE_FIELDS`` (``session_id``,
         ``messages``, ``tool_calls``, ``message_count``) are rejected.
+
+        ``expected_incarnation`` exists for SessionStore signature parity;
+        sidecar writes are atomic-replace with no generation/incarnation CAS
+        (last-writer-wins), so the token is accepted and unused here.
 
         Runtime wiring must add Session lock/cache/index parity before using
         it from live WebUI routes.
@@ -151,8 +161,18 @@ class WebUIJsonSessionDB:
         self._atomic_write(path, data)
         return self._metadata_row(str(data.get("session_id") or sid), data)
 
-    def archive(self, sid: str, archived: bool = True) -> dict[str, Any]:
-        """Set the archived metadata flag without touching transcript messages."""
+    def archive(
+        self,
+        sid: str,
+        archived: bool = True,
+        *,
+        expected_incarnation: int | None = None,
+    ) -> dict[str, Any]:
+        """Set the archived metadata flag without touching transcript messages.
+
+        ``expected_incarnation`` is accepted for SessionStore parity and
+        unused (last-writer-wins).
+        """
         return self.update_metadata(sid, {"archived": bool(archived)})
 
     def read_row_version(self, sid: str) -> None:
@@ -242,13 +262,15 @@ class WebUIJsonSessionDB:
         session: dict[str, Any],
         *,
         expected_generation: int | None = None,
+        expected_incarnation: int | None = None,
         force: bool = False,
     ) -> dict[str, Any]:
         """Write a full session payload for tests and migration experiments.
 
-        ``expected_generation``/``force`` exist for SessionStore signature
-        parity; sidecar writes are atomic-replace with no generation CAS, so
-        they are accepted and unused here.
+        ``expected_generation``/``expected_incarnation``/``force`` exist for
+        SessionStore signature parity; sidecar writes are atomic-replace
+        with no generation CAS (last-writer-wins), so they are accepted and
+        unused here.
         """
         if not isinstance(session, dict):
             raise TypeError("session must be a dict")

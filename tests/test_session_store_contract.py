@@ -18,11 +18,31 @@ from pathlib import Path
 import pytest
 
 from api.webui_session_db import WebUIJsonSessionDB
-from api.webui_session_sqlite import WebUISqliteSessionDB, StaleSessionWriteError
+from api.webui_session_sqlite import (
+    DeletedSessionWriteError,
+    WebUISqliteSessionDB,
+    StaleSessionWriteError,
+)
 
 
 def _tmp_dir():
     return Path(tempfile.mkdtemp())
+
+
+def _tok(store, sid: str) -> dict:
+    """The current durable (generation, incarnation) writer token for sid.
+
+    SQL backends require both halves on versioned writes; the JSON backend
+    has no durable version (last-writer-wins), so it gets no token kwargs.
+    """
+    if not getattr(store, "supports_generation", False):
+        return {}
+    ver = store.read_row_version(sid)
+    assert ver is not None, f"no live row for {sid}"
+    return {
+        "expected_generation": ver["generation"],
+        "expected_incarnation": ver["incarnation"],
+    }
 
 
 def _sample(sid: str) -> dict:
@@ -103,7 +123,7 @@ def test_session_exists(store):
 
 def test_update_metadata_preserves_transcript(store):
     store.write_session(_sample("c3"))
-    store.update_metadata("c3", {"composer_draft": {"text": "draft", "files": []}})
+    store.update_metadata("c3", {"composer_draft": {"text": "draft", "files": []}}, **_tok(store, "c3"))
     loaded = store.read_session("c3")
     assert loaded["composer_draft"]["text"] == "draft"
     assert len(loaded["messages"]) == 2
@@ -152,7 +172,7 @@ def test_revision_bumps_on_writes_and_deletes(sql_store):
     sql_store.write_session(_sample("c7"))
     r1 = sql_store.get_revision()
     assert r1 > r0
-    sql_store.update_metadata("c7", {"title": "renamed"})
+    sql_store.update_metadata("c7", {"title": "renamed"}, **_tok(sql_store, "c7"))
     r2 = sql_store.get_revision()
     assert r2 > r1
     sql_store.delete_session("c7")
@@ -172,10 +192,10 @@ def test_generation_cas(sql_store):
     sql_store.write_session(_sample("c9"))  # generation 1
     with pytest.raises(StaleSessionWriteError):
         sql_store.write_session(_sample("c9"))  # no lineage
-    sql_store.write_session(_sample("c9"), expected_generation=1)  # bump -> 2
+    sql_store.write_session(_sample("c9"), expected_generation=1, expected_incarnation=1)  # bump -> 2
     assert sql_store.read_session("c9")["generation"] == 2
     with pytest.raises(StaleSessionWriteError):
-        sql_store.write_session(_sample("c9"), expected_generation=1)  # stale
+        sql_store.write_session(_sample("c9"), expected_generation=1, expected_incarnation=1)  # stale
     sql_store.write_session(_sample("c9"), force=True)  # deliberate heal
     assert sql_store.read_session("c9")["generation"] == 3
 
@@ -184,8 +204,11 @@ def test_update_metadata_advances_generation(sql_store):
     """Metadata-only writers move the same version fence as full writes."""
     sql_store.write_session(_sample("g1"))  # generation 1
     assert sql_store.read_session("g1")["generation"] == 1
-    meta = sql_store.update_metadata("g1", {"composer_draft": {"text": "x", "files": []}})
+    meta = sql_store.update_metadata(
+        "g1", {"composer_draft": {"text": "x", "files": []}}, **_tok(sql_store, "g1")
+    )
     assert meta["generation"] == 2
+    assert meta["incarnation"] == 1
     row = sql_store.read_session("g1")
     assert row["generation"] == 2
     # Row content otherwise preserved.
@@ -207,7 +230,7 @@ def test_read_row_version_sql(sql_store):
     assert sql_store.read_row_version("rv1") is None  # absent
     sql_store.write_session(_sample("rv1"))
     assert sql_store.read_row_version("rv1") == {"generation": 1, "incarnation": 1}
-    sql_store.update_metadata("rv1", {"title": "renamed"})
+    sql_store.update_metadata("rv1", {"title": "renamed"}, **_tok(sql_store, "rv1"))
     assert sql_store.read_row_version("rv1") == {"generation": 2, "incarnation": 1}
     sql_store.delete_session("rv1")
     assert sql_store.read_row_version("rv1") is None  # retired
@@ -215,6 +238,101 @@ def test_read_row_version_sql(sql_store):
     assert sql_store.read_row_version("rv1") == {"generation": 1, "incarnation": 2}
     # Path-unsafe ids are refused, not queried.
     assert sql_store.read_row_version("../escape") is None
+
+
+def test_write_session_incarnation_token_fences_equal_generation_recreate(sql_store):
+    """The (incarnation, generation) pair — not the generation alone — is
+    the writer token. A delete + leased recreate restarts the row at
+    generation 1, so a stale owner of the old incarnation presents an
+    EQUAL generation; only the incarnation half refuses it."""
+    sql_store.write_session(_sample("eq1"))  # gen 1, inc 1
+    assert sql_store.read_row_version("eq1") == {"generation": 1, "incarnation": 1}
+    assert sql_store.delete_session("eq1") is True
+    sql_store.write_session(_sample("eq1"), fresh_incarnation=True)  # gen 1, inc 2
+    # Parent-discriminating prelude: the equal-generation CAS alone must not
+    # let the old-incarnation writer through.
+    stale = None
+    try:
+        stale = sql_store.write_session(_sample("eq1"), expected_generation=1)
+    except StaleSessionWriteError:
+        pass
+    assert stale is None  # parent fails HERE (the write succeeded)
+    with pytest.raises(StaleSessionWriteError):
+        sql_store.write_session(_sample("eq1"), expected_generation=1, expected_incarnation=1)
+    out = sql_store.write_session(_sample("eq1"), expected_generation=1, expected_incarnation=2)
+    assert out["generation"] == 2
+    assert sql_store.read_row_version("eq1") == {"generation": 2, "incarnation": 2}
+
+
+def test_update_metadata_requires_and_validates_version_token(sql_store):
+    """update_metadata is a versioned writer: the (generation, incarnation)
+    token is required and both halves are validated against the live row +
+    non-retired authority."""
+    sql_store.write_session(_sample("um1"))  # gen 1, inc 1
+
+    # Unversioned metadata write: refused (fail closed, not lenient).
+    with pytest.raises(StaleSessionWriteError):
+        sql_store.update_metadata("um1", {"title": "unversioned"})
+    assert sql_store.read_session("um1")["title"] == "Contract Session"
+
+    # Correct token: applies, bumps generation, returns both token halves.
+    out = sql_store.update_metadata(
+        "um1", {"title": "versioned"}, expected_generation=1, expected_incarnation=1
+    )
+    assert out["title"] == "versioned"
+    assert out["generation"] == 2
+    assert out["incarnation"] == 1
+
+    # Wrong generation: refused, row unchanged.
+    with pytest.raises(StaleSessionWriteError):
+        sql_store.update_metadata(
+            "um1", {"title": "wrong-gen"}, expected_generation=1, expected_incarnation=1
+        )
+    # Right generation, wrong incarnation: refused.
+    with pytest.raises(StaleSessionWriteError):
+        sql_store.update_metadata(
+            "um1", {"title": "wrong-inc"}, expected_generation=2, expected_incarnation=9
+        )
+    row = sql_store.read_session("um1")
+    assert row["title"] == "versioned"
+    assert row["generation"] == 2
+
+    # Tokens against an absent row: DeletedSessionWriteError.
+    with pytest.raises(DeletedSessionWriteError):
+        sql_store.update_metadata(
+            "um-missing", {"title": "x"}, expected_generation=1, expected_incarnation=1
+        )
+    # Tokens against a deleted (retired) row: DeletedSessionWriteError.
+    sql_store.delete_session("um1")
+    with pytest.raises(DeletedSessionWriteError):
+        sql_store.update_metadata(
+            "um1", {"title": "x"}, expected_generation=2, expected_incarnation=1
+        )
+
+
+def test_read_paths_expose_incarnation(sql_store):
+    """read_session / read_metadata_only / update_metadata return rows carry
+    the incarnation half of the writer token; it advances only on a leased
+    recreate. The sidebar list path is deliberately not joined."""
+    sql_store.write_session(_sample("ri1"))  # gen 1, inc 1
+    full = sql_store.read_session("ri1")
+    assert full["incarnation"] == 1
+    meta = sql_store.read_metadata_only("ri1")
+    assert meta["incarnation"] == 1
+    out = sql_store.update_metadata(
+        "ri1", {"title": "t2"}, expected_generation=1, expected_incarnation=1
+    )
+    assert out["incarnation"] == 1  # metadata writes bump generation only
+    assert out["generation"] == 2
+    # list_sessions does not JOIN the authority: list rows are unchanged.
+    listed = sql_store.list_sessions()
+    assert listed and all("incarnation" not in r for r in listed)
+    # The incarnation advances only on a fresh_incarnation=True recreate.
+    sql_store.delete_session("ri1")
+    sql_store.write_session(_sample("ri1"), fresh_incarnation=True)
+    assert sql_store.read_session("ri1")["incarnation"] == 2
+    assert sql_store.read_metadata_only("ri1")["incarnation"] == 2
+    assert sql_store.read_row_version("ri1") == {"generation": 1, "incarnation": 2}
 
 
 def test_reconcile_marked_write_overlays_only_given_fields(sql_store):
@@ -320,7 +438,9 @@ def test_null_key_presence(sql_store):
     loaded = sql_store.read_session("c10")
     assert "personality" in loaded and loaded["personality"] is None
     assert "project_id" in loaded and loaded["project_id"] is None
-    sql_store.update_metadata("c10", {"personality": "set", "threshold_tokens": None})
+    sql_store.update_metadata(
+        "c10", {"personality": "set", "threshold_tokens": None}, **_tok(sql_store, "c10")
+    )
     reloaded = sql_store.read_session("c10")
     assert reloaded["personality"] == "set"
     assert "threshold_tokens" in reloaded and reloaded["threshold_tokens"] is None
@@ -370,6 +490,7 @@ def test_session_model_runs_on_postgres_backend(monkeypatch, tmp_path):
         messages=[{"role": "user", "content": "hi"}],
     )
     stale._persisted_generation = 1
+    stale._persisted_incarnation = 1
     try:
         stale.save()
     except StaleSessionWriteError:
@@ -378,6 +499,59 @@ def test_session_model_runs_on_postgres_backend(monkeypatch, tmp_path):
         raise AssertionError("stale model-layer writer must be rejected on PG")
 
     assert store.read_session("pg-model")["title"] == "PG2"
+
+
+def test_session_equal_generation_recreate_fenced_on_postgres(monkeypatch, tmp_path):
+    """The T1 schedule through models.Session on a real Postgres store: an
+    owner loaded at (generation 1, incarnation 1) survives a delete +
+    leased recreate (the new row is ALSO generation 1); its ordinary save()
+    must be fenced by the incarnation half of the writer token."""
+    import os as _os
+
+    dsn = _os.environ.get("HERMES_TEST_PG_DSN")
+    if not dsn:
+        pytest.skip("HERMES_TEST_PG_DSN not set")
+
+    import api.models as models
+    from api.webui_session_postgres import WebUIPostgresSessionDB
+
+    store = WebUIPostgresSessionDB(dsn)
+    conn = store._conn()
+    with conn:
+        conn.execute(
+            "TRUNCATE sessions, messages, tool_calls, context_messages, anchor_scenes, session_incarnations"
+        )
+    monkeypatch.setattr(models, "_pg_session_store_instance", store)
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", tmp_path / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", {})
+
+    store.write_session(_sample("pg-eq"))  # gen 1, inc 1
+    owner = models.Session.load("pg-eq")
+    assert owner is not None
+    assert owner._persisted_generation == 1
+    assert owner._persisted_incarnation == 1
+
+    assert store.delete_session("pg-eq") is True
+    recreated = _sample("pg-eq")
+    recreated["title"] = "recreated incarnation"
+    store.write_session(recreated, fresh_incarnation=True)  # gen 1, inc 2
+
+    # The stale owner's ordinary save() must be refused: the generation
+    # alone (1 == 1) cannot discriminate it from the new incarnation.
+    owner.title = "stale equal-generation write"
+    with pytest.raises(StaleSessionWriteError):
+        owner.save()
+
+    row = store.read_session("pg-eq")
+    assert row["title"] == "recreated incarnation"
+    assert store.read_row_version("pg-eq") == {"generation": 1, "incarnation": 2}
+    fresh = models.Session.load("pg-eq")
+    assert fresh is not None
+    assert fresh.title == "recreated incarnation"
+    assert fresh._persisted_generation == 1
+    assert fresh._persisted_incarnation == 2
+    store.close()
 
 
 def test_cutover_marker_blocks_incomplete_migration(sql_store):
@@ -392,7 +566,7 @@ def test_update_metadata_preserves_unknown_keys(store):
     """One metadata policy: unknown top-level keys persist on every backend
     (JSON sidecar dict, SQL extra_json); only _UNSAFE_FIELDS are rejected."""
     store.write_session(_sample("c11"))
-    store.update_metadata("c11", {"future_field": {"nested": [1, 2]}})
+    store.update_metadata("c11", {"future_field": {"nested": [1, 2]}}, **_tok(store, "c11"))
     loaded = store.read_session("c11")
     assert loaded["future_field"] == {"nested": [1, 2]}
     assert len(loaded["messages"]) == 2
