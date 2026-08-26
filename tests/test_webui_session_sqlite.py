@@ -2339,6 +2339,176 @@ def test_ephemeral_cancel_cleanup_records_durable_lease(monkeypatch):
     assert leases[0]["owner"] == "ephemeral"
 
 
+# ── Durable phased deletion (residual cleanup lifecycle) ────────────────────
+
+
+def test_delete_route_500_with_durable_residuals_when_sidecar_unlink_fails(monkeypatch):
+    """A sidecar unlink failure after the committed store delete must 500
+    with the residual durably recorded — never ok:true with a silent leak.
+    Re-POSTing once healthy drains the phase rows and returns 200."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-resid")
+    store.write_session(payload)
+    sidecar = d / "sid-resid.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+    monkeypatch.setattr(models, "delete_cli_session", lambda sid: True)
+
+    real_unlink = Path.unlink
+
+    def _boom(self, *args, **kwargs):
+        if self == sidecar:
+            raise OSError("simulated unlink failure")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", _boom)
+
+    captured = _drive_delete_post(monkeypatch, {"session_id": "sid-resid"})
+    assert captured.get("status") == 500
+    assert "cleanup incomplete" in captured.get("error", "")
+    assert "sidecar" in captured.get("error", "")
+    # The authoritative delete DID commit — only the residual remains.
+    assert store.session_exists("sid-resid") is False
+    rows = store.list_cleanup_phases("sid-resid")
+    assert [r["phase"] for r in rows] == ["sidecar"]
+    assert rows[0]["attempts"] == 1
+    assert rows[0]["error"]
+    assert sidecar.exists()
+
+    # Recovery: the identical re-POST resumes at the remaining row only.
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    captured = _drive_delete_post(monkeypatch, {"session_id": "sid-resid"})
+    assert captured.get("payload", {}).get("ok") is True
+    assert captured["payload"]["state_db_cleanup_failed"] is False
+    assert store.list_cleanup_phases("sid-resid") == []
+    assert not sidecar.exists()
+
+
+def test_sessions_cleanup_does_not_count_residual_sid_and_janitor_completes(monkeypatch):
+    """cleaned must not count a session whose residual phase failed: the sid
+    lands in `failed` with a durable phase row, and a healthy re-run drains
+    it via the janitor pre-pass."""
+    import api.routes as routes
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    monkeypatch.setattr(routes, "SESSION_INDEX_FILE", d / "_index.json")
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-unclean")
+    payload["title"] = "Untitled"
+    payload["messages"] = []
+    store.write_session(payload)
+    sidecar = d / "sid-unclean.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+    monkeypatch.setattr(models, "delete_cli_session", lambda sid: True)
+
+    real_unlink = Path.unlink
+
+    def _boom(self, *args, **kwargs):
+        if self == sidecar:
+            raise OSError("simulated unlink failure")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", _boom)
+
+    captured = {}
+    monkeypatch.setattr(
+        routes, "j", lambda handler, payload, **kwargs: captured.update(payload) or True
+    )
+    handler = SimpleNamespace(_safe_webui_print=lambda *_a, **_k: None)
+    routes._handle_sessions_cleanup(handler, {}, zero_only=False)
+
+    assert captured["ok"] is False
+    assert "sid-unclean" in captured["failed"]
+    assert captured["cleaned"] == 0
+    assert captured["residuals"].get("sid-unclean") == ["sidecar"]
+    rows = store.list_cleanup_phases("sid-unclean")
+    assert [r["phase"] for r in rows] == ["sidecar"]
+    # The store delete committed; only the sidecar residual remains.
+    assert store.session_exists("sid-unclean") is False
+    assert sidecar.exists()
+
+    # Healthy re-run: the janitor pre-pass drains the leftover row.
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    captured.clear()
+    routes._handle_sessions_cleanup(handler, {}, zero_only=False)
+    assert captured["ok"] is True
+    assert not sidecar.exists()
+    assert store.list_cleanup_phases() == []
+
+
+def test_sessions_cleanup_janitor_drains_orphaned_phase_rows(monkeypatch):
+    """A crash between the delete txn and the executor leaves durable phase
+    rows; the cleanup pre-pass janitor resumes and drains them without
+    counting the sid or reporting it failed."""
+    import api.routes as routes
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    monkeypatch.setattr(routes, "SESSION_INDEX_FILE", d / "_index.json")
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-orphan")
+    store.write_session(payload)
+    sidecar = d / "sid-orphan.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+    monkeypatch.setattr(models, "delete_cli_session", lambda sid: True)
+
+    # Simulate the crash: the delete txn committed the row delete + the
+    # phase rows; the executor never ran.
+    result = store.lifecycle_delete("sid-orphan", owner="x", pending_phases=["sidecar"])
+    assert result["ok"] is True
+    assert [r["phase"] for r in store.list_cleanup_phases("sid-orphan")] == ["sidecar"]
+    assert sidecar.exists()
+
+    captured = {}
+    monkeypatch.setattr(
+        routes, "j", lambda handler, payload, **kwargs: captured.update(payload) or True
+    )
+    handler = SimpleNamespace(_safe_webui_print=lambda *_a, **_k: None)
+    routes._handle_sessions_cleanup(handler, {}, zero_only=False)
+
+    assert captured["ok"] is True
+    assert "sid-orphan" not in captured["failed"]
+    assert not sidecar.exists()
+    assert store.list_cleanup_phases() == []
+
+
+def test_delete_route_state_db_phase_500s_until_cleaned(monkeypatch):
+    """state_db cleanup failure is no longer an ok:true payload flag: it is
+    a durable residual phase that 500s until a retry drains it."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-statedb"))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    # The state_db actuator short-circuits when no state.db exists, so point
+    # it at a real file to exercise the delete_cli_session result path.
+    state_db = d / "state.db"
+    state_db.touch()
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: state_db)
+    monkeypatch.setattr(models, "delete_cli_session", lambda sid: False)
+
+    captured = _drive_delete_post(monkeypatch, {"session_id": "sid-statedb"})
+    assert captured.get("status") == 500
+    assert "state_db" in captured.get("error", "")
+    assert store.session_exists("sid-statedb") is False
+    rows = store.list_cleanup_phases("sid-statedb")
+    assert [r["phase"] for r in rows] == ["state_db"]
+
+    monkeypatch.setattr(models, "delete_cli_session", lambda sid: True)
+    captured = _drive_delete_post(monkeypatch, {"session_id": "sid-statedb"})
+    assert captured.get("payload", {}).get("ok") is True
+    assert captured["payload"]["state_db_cleanup_failed"] is False
+    assert store.list_cleanup_phases("sid-statedb") == []
+
+
 def _drive_delete_post(monkeypatch, body):
     """Run POST /api/session/delete through routes.handle_post (CSRF bypassed,
     JSON responders captured) and return the captured response."""
@@ -2474,3 +2644,4 @@ def test_draft_route_json_fallback_ordering_for_unmigrated_session(monkeypatch):
     reloaded = models.Session.load(sid)
     assert reloaded.composer_draft["text"] == "json route draft"
     assert len(reloaded.messages) == 2
+

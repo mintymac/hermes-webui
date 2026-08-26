@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 # Keep JSON blobs compact.
 _json_dump = lambda obj: json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
@@ -293,10 +293,28 @@ CREATE TABLE IF NOT EXISTS cleanup_leases (
     updated_at REAL NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 1
 );
+
+-- Durable residual-cleanup phases (schema v6). Deliberately a SEPARATE table
+-- from cleanup_leases: leases mean "the authoritative store delete FAILED"
+-- and are cleared on lifecycle_delete success; phase rows mean "the delete
+-- SUCCEEDED, these residual artifacts remain" — they are recorded in the
+-- same transaction as the authoritative delete and cleared per phase as the
+-- executor drains them. Keyed by (session_id, phase). attempts counts failed
+-- executor runs (the row is recorded at delete time with attempts=0, before
+-- any cleanup attempt has run).
+CREATE TABLE IF NOT EXISTS cleanup_phases (
+    session_id TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    error TEXT,
+    updated_at REAL NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (session_id, phase)
+);
 """
 
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 
 _META_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -895,54 +913,105 @@ class WebUISqliteSessionDB:
                 return None  # CAS belt-and-braces inside the txn
         return self.read_session(sid)
 
-    def delete_session(self, sid: str) -> bool:
+    def delete_session(self, sid: str, *, _txn: sqlite3.Connection | None = None) -> bool:
         """Remove a session and all its rows. Returns True if a row existed.
 
         Required by /api/session/delete: migrated sessions have no JSON
         sidecar, so unlinking the sidecar alone leaves the SQLite rows
         behind — and a full session-index rebuild would then resurrect the
         deleted session in the sidebar (and keep the transcript on disk).
+
+        ``_txn`` is the internal caller-owned transaction used by
+        ``lifecycle_delete`` so the delete and its residual-phase rows
+        commit atomically; public callers never pass it.
         """
         if not _is_safe_session_id(sid):
             return False
+        if _txn is not None:
+            return self._delete_session_in_txn(_txn, sid)
         conn = self._conn()
         with conn:
-            self._bump_revision(conn)
-            row = conn.execute(
-                "SELECT generation FROM sessions WHERE session_id = ?", (sid,)
-            ).fetchone()
-            old_generation = int(row["generation"] or 0) if row is not None else 0
-            cur = conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
-            conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-            conn.execute("DELETE FROM tool_calls WHERE session_id = ?", (sid,))
-            conn.execute("DELETE FROM context_messages WHERE session_id = ?", (sid,))
-            conn.execute("DELETE FROM anchor_scenes WHERE session_id = ?", (sid,))
-            if cur.rowcount > 0:
-                # Retire the SID in the incarnation authority (which survives
-                # the delete) so a stale pre-delete writer cannot resurrect
-                # the transcript. The incarnation counter does NOT move on
-                # delete — only a leased recreate advances it.
-                conn.execute(
-                    "INSERT INTO session_incarnations "
-                    "(session_id, incarnation, retired, retired_generation) "
-                    "VALUES (?, 1, 1, ?) "
-                    "ON CONFLICT(session_id) DO UPDATE SET "
-                    "retired = 1, retired_generation = excluded.retired_generation",
-                    (sid, old_generation),
-                )
+            return self._delete_session_in_txn(conn, sid)
+
+    def _delete_session_in_txn(self, conn: sqlite3.Connection, sid: str) -> bool:
+        """The authoritative delete body; the CALLER owns the transaction.
+
+        Split out so ``lifecycle_delete(pending_phases=...)`` can delete the
+        rows and record the residual-cleanup phases in ONE transaction — no
+        crash window between "store deleted" and "residuals durably
+        observable".
+        """
+        self._bump_revision(conn)
+        row = conn.execute(
+            "SELECT generation FROM sessions WHERE session_id = ?", (sid,)
+        ).fetchone()
+        old_generation = int(row["generation"] or 0) if row is not None else 0
+        cur = conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+        conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+        conn.execute("DELETE FROM tool_calls WHERE session_id = ?", (sid,))
+        conn.execute("DELETE FROM context_messages WHERE session_id = ?", (sid,))
+        conn.execute("DELETE FROM anchor_scenes WHERE session_id = ?", (sid,))
+        if cur.rowcount > 0:
+            # Retire the SID in the incarnation authority (which survives
+            # the delete) so a stale pre-delete writer cannot resurrect the
+            # transcript. The incarnation counter does NOT move on
+            # delete — only a leased recreate advances it.
+            conn.execute(
+                "INSERT INTO session_incarnations "
+                "(session_id, incarnation, retired, retired_generation) "
+                "VALUES (?, 1, 1, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "retired = 1, retired_generation = excluded.retired_generation",
+                (sid, old_generation),
+            )
         return cur.rowcount > 0
 
-    def lifecycle_delete(self, sid: str, *, owner: str) -> dict[str, Any]:
+    def lifecycle_delete(
+        self,
+        sid: str,
+        *,
+        owner: str,
+        pending_phases: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         """Delete with durable retry ownership (SessionStore contract).
 
         Success clears any cleanup lease for ``sid`` in the same store;
         failure records a lease keyed by ``sid`` so the retry owner
         survives a crash. Never touches the JSON sidecar — that
         representation is not store-owned.
+
+        ``pending_phases``: residual-cleanup phase names recorded IN THE
+        SAME transaction as the authoritative delete (upserted into
+        ``cleanup_phases``; ON CONFLICT preserves ``attempts`` and refreshes
+        owner/updated_at), so a crash cannot leave residuals unobservable.
+        Default None means delete + lease handling only (unchanged
+        behavior). Leases and phases never coexist for a sid: a lease means
+        the delete failed, phases mean it succeeded with residuals
+        remaining.
         """
         conn = self._conn()
         try:
-            existed = self.delete_session(sid)
+            if pending_phases:
+                with conn:
+                    # Route through the public delete_session seam (the
+                    # delete failure-injection point) with the caller-owned
+                    # transaction, so rows + phase rows commit atomically.
+                    existed = self.delete_session(sid, _txn=conn)
+                    conn.execute("DELETE FROM cleanup_leases WHERE session_id = ?", (sid,))
+                    now = time.time()
+                    for phase in pending_phases:
+                        conn.execute(
+                            "INSERT INTO cleanup_phases "
+                            "(session_id, phase, owner, error, updated_at, attempts) "
+                            "VALUES (?, ?, ?, NULL, ?, 0) "
+                            "ON CONFLICT(session_id, phase) DO UPDATE SET "
+                            "owner = excluded.owner, updated_at = excluded.updated_at",
+                            (sid, phase, owner, now),
+                        )
+            else:
+                existed = self.delete_session(sid)
+                with conn:
+                    conn.execute("DELETE FROM cleanup_leases WHERE session_id = ?", (sid,))
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             with conn:
@@ -961,9 +1030,45 @@ class WebUISqliteSessionDB:
             except Exception:
                 existed = False
             return {"ok": False, "error": error, "existed": existed}
-        with conn:
-            conn.execute("DELETE FROM cleanup_leases WHERE session_id = ?", (sid,))
         return {"ok": True, "existed": bool(existed)}
+
+    def finish_cleanup_phase(
+        self, sid: str, phase: str, *, ok: bool, error: str | None = None
+    ) -> None:
+        """Record one residual-cleanup attempt: ok clears the row; failure
+        updates error/updated_at and bumps attempts."""
+        conn = self._conn()
+        with conn:
+            if ok:
+                conn.execute(
+                    "DELETE FROM cleanup_phases WHERE session_id = ? AND phase = ?",
+                    (sid, phase),
+                )
+            else:
+                conn.execute(
+                    "UPDATE cleanup_phases SET error = ?, updated_at = ?, "
+                    "attempts = attempts + 1 "
+                    "WHERE session_id = ? AND phase = ?",
+                    (error, time.time(), sid, phase),
+                )
+
+    def list_cleanup_phases(self, sid: str | None = None) -> list[dict[str, Any]]:
+        """Remaining residual-cleanup phase rows (for ``sid``, or every row
+        for a janitor sweep), ordered by session_id, phase."""
+        conn = self._conn()
+        if sid is None:
+            rows = conn.execute(
+                "SELECT session_id, phase, owner, error, updated_at, attempts "
+                "FROM cleanup_phases ORDER BY session_id, phase"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT session_id, phase, owner, error, updated_at, attempts "
+                "FROM cleanup_phases WHERE session_id = ? "
+                "ORDER BY session_id, phase",
+                (sid,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def list_cleanup_leases(self, owner: str | None = None) -> list[dict[str, Any]]:
         """Durable retry leases recorded by failed ``lifecycle_delete`` calls."""

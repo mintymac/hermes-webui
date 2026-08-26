@@ -689,3 +689,59 @@ def test_configured_postgres_lifecycle_paths(monkeypatch, tmp_path):
         with conn:
             conn.execute("DELETE FROM meta WHERE key = 'migration_complete'")
         store.close()
+
+
+# ── Durable residual-cleanup phases (cleanup_phases ledger) ──────────────────
+
+
+def test_lifecycle_delete_records_pending_phases_atomically(sql_store):
+    """The residual phase rows commit in the SAME transaction as the
+    authoritative delete: when lifecycle_delete returns ok, the ledger is
+    already observable (no interleaving window), and per-phase outcomes
+    clear or annotate rows. Leases and phases never coexist."""
+    sql_store.write_session(_sample("ph1"))
+    result = sql_store.lifecycle_delete(
+        "ph1", owner="t", pending_phases=["sidecar", "state_db"]
+    )
+    assert result["ok"] is True and result["existed"] is True
+    assert sql_store.session_exists("ph1") is False
+    rows = sql_store.list_cleanup_phases("ph1")
+    assert [r["phase"] for r in rows] == ["sidecar", "state_db"]
+    assert all(r["owner"] == "t" for r in rows)
+    assert all(r["attempts"] == 0 for r in rows)  # recorded, not yet attempted
+    assert sql_store.list_cleanup_leases() == []
+
+    # ok=True clears one row.
+    sql_store.finish_cleanup_phase("ph1", "sidecar", ok=True)
+    assert [r["phase"] for r in sql_store.list_cleanup_phases("ph1")] == ["state_db"]
+
+    # ok=False records the error and bumps attempts.
+    sql_store.finish_cleanup_phase("ph1", "state_db", ok=False, error="boom")
+    (row,) = sql_store.list_cleanup_phases("ph1")
+    assert row["attempts"] == 1
+    assert row["error"] == "boom"
+
+    # Re-recording (a retried delete) preserves attempts, refreshes owner.
+    result = sql_store.lifecycle_delete("ph1", owner="t2", pending_phases=["state_db"])
+    assert result["ok"] is True and result["existed"] is False
+    (row,) = sql_store.list_cleanup_phases("ph1")
+    assert row["attempts"] == 1
+    assert row["owner"] == "t2"
+
+    # The unfiltered janitor sweep sees the row; final clear empties it.
+    assert [r["session_id"] for r in sql_store.list_cleanup_phases()] == ["ph1"]
+    sql_store.finish_cleanup_phase("ph1", "state_db", ok=True)
+    assert sql_store.list_cleanup_phases() == []
+
+
+def test_lifecycle_delete_pending_phases_json_backend_inert():
+    """The JSON backend accepts pending_phases and ignores them: no durable
+    ledger exists in a last-writer-wins file world (the same capability
+    boundary as cleanup leases)."""
+    store = WebUIJsonSessionDB(session_dir=_tmp_dir())
+    store.write_session(_sample("j1"))
+    result = store.lifecycle_delete("j1", owner="t", pending_phases=["sidecar"])
+    assert result["ok"] is True and result["existed"] is True
+    store.finish_cleanup_phase("j1", "sidecar", ok=False, error="boom")  # no-op
+    assert store.list_cleanup_phases() == []
+    assert store.list_cleanup_phases("j1") == []

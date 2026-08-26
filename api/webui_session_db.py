@@ -12,7 +12,7 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import api.models as models
 
@@ -217,12 +217,18 @@ class WebUIJsonSessionDB:
             return False
         return existed
 
-    def lifecycle_delete(self, sid: str, *, owner: str) -> dict[str, Any]:
+    def lifecycle_delete(
+        self, sid: str, *, owner: str, pending_phases: Sequence[str] | None = None
+    ) -> dict[str, Any]:
         """Delete with retry-ownership semantics (SessionStore contract).
 
         The JSON backend has no crash-safe lease: sidecars are
         last-writer-wins files, so a failure result here is process-local
         only — the caller retains retry ownership by keeping the file.
+        ``pending_phases`` is accepted and ignored for the same reason
+        (no durable home for a phase ledger); note ``delete_session``
+        already unlinks the sidecar AND the stale .bak, so pure-JSON
+        deployments only lose durable retry, not truthfulness.
         """
         path = self._path_for_sid(sid)
         existed = path is not None and path.exists()
@@ -237,6 +243,17 @@ class WebUIJsonSessionDB:
         if existed and path is not None and path.exists():
             return {"ok": False, "error": "sidecar still present after delete", "existed": True}
         return {"ok": True, "existed": existed}
+
+    def finish_cleanup_phase(
+        self, sid: str, phase: str, *, ok: bool, error: str | None = None
+    ) -> None:
+        """No-op: the JSON backend has no durable phase ledger (the same
+        capability boundary as cleanup leases — last-writer-wins files)."""
+        return None
+
+    def list_cleanup_phases(self, sid: str | None = None) -> list[dict[str, Any]]:
+        """No durable phase ledger on the JSON backend; always empty."""
+        return []
 
     def get_revision(self) -> int:
         """JSON freshness signal: the session directory mtime in ns.

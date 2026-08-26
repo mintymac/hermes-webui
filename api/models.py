@@ -1483,7 +1483,7 @@ def _active_session_store_if_sidecarless():
     return store if getattr(store, "persists_without_sidecar", False) else None
 
 
-def delete_session_record(sid: str, *, owner: str = "delete_route") -> bool:
+def delete_session_record(sid: str, *, owner: str = "delete_route", pending_phases=None) -> bool:
     """Remove a session's authoritative record via the canonical store.
 
     Delegates to the store's ``lifecycle_delete`` so a failed delete
@@ -1494,8 +1494,14 @@ def delete_session_record(sid: str, *, owner: str = "delete_route") -> bool:
     instead of reporting a cleanup that silently leaked the record.
     Returns whether the record existed. Sidecar unlinks for SQL-backed
     cleanups are left to callers (``missing_ok=True``).
+
+    ``pending_phases`` is passed through to ``lifecycle_delete``: residual
+    -cleanup phase names recorded in the same transaction as the delete
+    (SQL backends; accepted and ignored by the JSON backend).
     """
-    result = get_session_store().lifecycle_delete(sid, owner=owner)
+    result = get_session_store().lifecycle_delete(
+        sid, owner=owner, pending_phases=pending_phases
+    )
     if not result.get("ok"):
         raise RuntimeError(
             f"lifecycle_delete failed for session {sid}: {result.get('error')}"

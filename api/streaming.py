@@ -2276,7 +2276,7 @@ def _cleanup_ephemeral_cancelled_turn(session) -> None:
 
     _sid = str(getattr(session, "session_id", "") or "")
     try:
-        delete_session_record(_sid, owner="ephemeral")
+        delete_session_record(_sid, owner="ephemeral", pending_phases=["sidecar"])
     except Exception:
         # Retain retryable ownership: a failed authoritative deletion must
         # not masquerade as a successful cleanup (or the row leaks while the
@@ -2290,7 +2290,18 @@ def _cleanup_ephemeral_cancelled_turn(session) -> None:
     try:
         import pathlib
 
+        # Mirrors exactly what this path always did (the ephemeral temp
+        # session's path can differ from the canonical SESSION_DIR sidecar
+        # the phase below covers).
         pathlib.Path(session.path).unlink(missing_ok=True)
+    except Exception:
+        logger.debug("Failed to clean up ephemeral cancelled session", exc_info=True)
+    try:
+        # Durable residual phase: records/retries the canonical sidecar
+        # removal so a failure leaves a row for the cleanup janitor.
+        from api.routes import _run_residual_phases
+
+        _run_residual_phases(_sid, phases=["sidecar"])
     except Exception:
         logger.debug("Failed to clean up ephemeral cancelled session", exc_info=True)
 

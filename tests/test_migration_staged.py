@@ -45,11 +45,20 @@ def _seed_sessions(d: Path, n: int = 3) -> None:
         (d / f"mig{i}.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _run_script(d: Path, crash: str | None, commit: bool) -> subprocess.CompletedProcess:
+def _run_script(
+    d: Path,
+    crash: str | None,
+    commit: bool,
+    extra_env: dict | None = None,
+) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env.pop("HERMES_MIGRATE_CRASH_AFTER", None)
+    env.pop("HERMES_MIGRATE_TEST_MUTATE", None)
+    env.pop("HERMES_MIGRATE_TEST_MUTATE_AFTER_PUBLISH", None)
     if crash:
         env["HERMES_MIGRATE_CRASH_AFTER"] = crash
+    if extra_env:
+        env.update(extra_env)
     cmd = [sys.executable, str(REPO / "scripts" / "migrate_sessions_to_sqlite.py"), str(d)]
     if commit:
         cmd.append("--commit")
@@ -304,3 +313,151 @@ def test_unrecognized_markers_fail_closed(tmp_path, monkeypatch):
     conn.commit()
     conn.close()
     assert _store_active(tmp_path, monkeypatch) is False
+
+
+# ── Cutover coordination: lock, source-identity CAS, partitioned skips ──────
+
+
+def test_migration_refuses_when_sidecar_drifts_after_copy(tmp_path, monkeypatch):
+    """A live writer racing the cutover must refuse the whole run BEFORE
+    publication: no sessions.db, no json-backup/, and the drifted sidecar
+    keeps its newer bytes on disk (no lost write)."""
+    _seed_sessions(tmp_path)
+    result = _run_script(
+        tmp_path, None, commit=True, extra_env={"HERMES_MIGRATE_TEST_MUTATE": "mig1"}
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "DRIFT mig1" in result.stdout
+    assert f"FAILURES: 1" in result.stdout
+    assert not (tmp_path / "sessions.db").exists()
+    assert not (tmp_path / "json-backup").exists()
+    # The newer bytes survive in place; nothing was retired.
+    assert sorted(p.name for p in tmp_path.glob("*.json")) == [f"mig{i}.json" for i in range(3)]
+    mutated = json.loads((tmp_path / "mig1.json").read_text(encoding="utf-8"))
+    assert mutated.get("_mutated") is not None
+    assert _store_active(tmp_path, monkeypatch) is False
+
+    # Quiesced re-run completes the cutover cleanly.
+    result = _run_script(tmp_path, None, commit=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _store_active(tmp_path, monkeypatch) is True
+
+
+def test_migration_retires_only_exact_preimage_after_publish(tmp_path, monkeypatch):
+    """Drift AFTER publication: the database is active, but the drifted
+    sidecar is left in place (exit 3), not moved into json-backup/ and not
+    auto-re-imported over the fenced SQL row."""
+    _seed_sessions(tmp_path)
+    result = _run_script(
+        tmp_path,
+        None,
+        commit=True,
+        extra_env={"HERMES_MIGRATE_TEST_MUTATE_AFTER_PUBLISH": "mig1"},
+    )
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "DRIFTED mig1" in result.stdout
+    assert _store_active(tmp_path, monkeypatch) is True
+    store = models._get_sqlite_session_store()
+    for i in range(3):
+        assert store.read_session(f"mig{i}") is not None
+    # The drifted sidecar stays in the session dir with its newer bytes;
+    # the other two retired to json-backup/.
+    assert (tmp_path / "mig1.json").exists()
+    assert json.loads((tmp_path / "mig1.json").read_text(encoding="utf-8")).get("_mutated")
+    assert sorted(p.name for p in (tmp_path / "json-backup").glob("*.json")) == [
+        "mig0.json",
+        "mig2.json",
+    ]
+
+
+def test_migration_skips_unparseable_sidecar_and_proceeds(tmp_path, monkeypatch):
+    """One bad legacy file must not abort the run: valid sessions migrate,
+    the unparseable sidecar is SKIP-reported and left in place."""
+    _seed_sessions(tmp_path)
+    (tmp_path / "bad.json").write_text("{not valid json", encoding="utf-8")
+    result = _run_script(tmp_path, None, commit=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SKIP bad" in result.stdout
+    assert _store_active(tmp_path, monkeypatch) is True
+    store = models._get_sqlite_session_store()
+    assert sorted(str(m["session_id"]) for m in store.list_sessions()) == [
+        f"mig{i}" for i in range(3)
+    ]
+    # Left in place, NOT retired to json-backup/.
+    assert (tmp_path / "bad.json").exists()
+    assert not (tmp_path / "json-backup" / "bad.json").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX flock path; the msvcrt branch is unit-tested below")
+def test_migration_lock_serializes_concurrent_runs(tmp_path, monkeypatch):
+    """A held .migrating.lock refuses a concurrent run (exit 1) before
+    anything is created or moved."""
+    import fcntl
+
+    _seed_sessions(tmp_path)
+    lock_path = tmp_path / ".migrating.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        result = _run_script(tmp_path, None, commit=True)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert ".migrating.lock" in (result.stdout + result.stderr)
+    assert not (tmp_path / "sessions.db").exists()
+    assert not (tmp_path / STAGED_NAME).exists()
+    assert not (tmp_path / "json-backup").exists()
+    assert sorted(p.name for p in tmp_path.glob("*.json")) == [f"mig{i}.json" for i in range(3)]
+
+
+def _load_migration_script_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "migrate_sessions_to_sqlite", REPO / "scripts" / "migrate_sessions_to_sqlite.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_migration_lock_msvcrt_branch(tmp_path, monkeypatch):
+    """The Windows lock fallback mirrors api.models' msvcrt pattern: lock
+    byte 0 with LK_LOCK/LK_UNLCK, contention or a missing primitive refuses
+    (SystemExit 1) instead of running an uncoordinated cutover."""
+    mod = _load_migration_script_module()
+    monkeypatch.setattr(mod, "_fcntl", None)
+
+    calls = []
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_UNLCK = 2
+
+        @staticmethod
+        def locking(fd, mode, nbytes):
+            calls.append(mode)
+
+    monkeypatch.setattr(mod, "_msvcrt", FakeMsvcrt)
+    with mod._migration_lock(tmp_path):
+        pass
+    assert calls == [FakeMsvcrt.LK_LOCK, FakeMsvcrt.LK_UNLCK]
+
+    class BusyMsvcrt(FakeMsvcrt):
+        @staticmethod
+        def locking(fd, mode, nbytes):
+            if mode == FakeMsvcrt.LK_LOCK:
+                raise OSError("locked")
+            calls.append(mode)
+
+    monkeypatch.setattr(mod, "_msvcrt", BusyMsvcrt)
+    with pytest.raises(SystemExit):
+        with mod._migration_lock(tmp_path):
+            pass
+
+    # No lock primitive at all: fail closed.
+    monkeypatch.setattr(mod, "_msvcrt", None)
+    with pytest.raises(SystemExit):
+        with mod._migration_lock(tmp_path):
+            pass

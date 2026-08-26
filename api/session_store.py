@@ -44,7 +44,7 @@ rows in a meta table.
 """
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 
 class SessionStore(Protocol):
@@ -186,7 +186,9 @@ class SessionStore(Protocol):
         """Remove the session and all its state. True if a row/file existed."""
         ...
 
-    def lifecycle_delete(self, sid: str, *, owner: str) -> dict[str, Any]:
+    def lifecycle_delete(
+        self, sid: str, *, owner: str, pending_phases: Sequence[str] | None = None
+    ) -> dict[str, Any]:
         """Delete the store-owned representation with durable retry ownership.
 
         Returns ``{"ok": True, "existed": bool}`` on success, or
@@ -200,9 +202,38 @@ class SessionStore(Protocol):
         SQL stores do not unlink JSON sidecars — callers do that only
         after an ``ok`` result).
 
-        The JSON sidecar backend has no crash-safe lease (last-writer-wins
-        file semantics); its failure result is process-local only.
+        ``pending_phases`` (SQL backends): residual-cleanup phase names
+        recorded IN THE SAME transaction as the authoritative delete
+        (upserted into ``cleanup_phases``; ON CONFLICT preserves
+        ``attempts``, refreshes owner/updated_at), so there is no crash
+        window between "store deleted" and "residuals durably
+        observable". Default None ⇒ exactly the delete + lease behavior
+        above. Leases and phases never coexist for a sid: a lease means
+        the delete *failed*; phases mean it *succeeded* with residuals
+        remaining.
+
+        The JSON sidecar backend has no crash-safe lease or phase ledger
+        (last-writer-wins file semantics); it accepts and ignores
+        ``pending_phases`` and its failure result is process-local only.
         """
+        ...
+
+    def finish_cleanup_phase(
+        self, sid: str, phase: str, *, ok: bool, error: str | None = None
+    ) -> None:
+        """Record the outcome of one residual-cleanup phase attempt.
+
+        ``ok=True`` deletes the ``cleanup_phases`` row; ``ok=False``
+        updates ``error``/``updated_at`` and bumps ``attempts``. SQL-only
+        durability; the JSON backend is a no-op (callers still run the
+        act+verify so behavior is truthful, just not durable).
+        """
+        ...
+
+    def list_cleanup_phases(self, sid: str | None = None) -> list[dict[str, Any]]:
+        """Remaining ``cleanup_phases`` rows for ``sid`` (or every row, for
+        a janitor sweep), ordered by session_id, phase. The JSON backend
+        returns []."""
         ...
 
     def archive(
