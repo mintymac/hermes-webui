@@ -2068,6 +2068,103 @@ def test_demote_does_not_clobber_concurrent_draft(monkeypatch):
     assert final["composer_draft"]["text"] == "D2"
 
 
+def test_demote_carry_fenced_against_interleaved_writer(monkeypatch):
+    """REGRESSION GUARD — passes on parent 933d25f by design.
+
+    The fenced demote carry landed with the (generation, incarnation)
+    writer-token work (task 009), so the parent tree already fences the
+    carry and this test PASSES there: it is NOT a parent-failing
+    discriminator. It closes the missing fenced-FAILURE leg of the
+    marked-draft-carry schedule (the success path and the demote-vs-draft
+    race are covered elsewhere; the suite's existing discriminators carry
+    the parent-fail criterion for this re-gate).
+
+    Scenario: the demote probe (read_session) returns healthy, then an
+    interleaved writer lands a fenced update_metadata that advances the
+    row generation BEFORE the demote's carry runs. The carry's conditional
+    update_metadata (tokens captured by the now-stale probe) must raise
+    StaleSessionWriteError; the demote swallows it, RETAINS the mark, and
+    leaves the interleaved write intact. A subsequent load (probe healthy
+    again, no interleaving) retries the carry and completes the demote —
+    the sidecar draft lands and the interleaved writer's title survives.
+    """
+    import sqlite3 as _sq
+
+    d = _tmp_session_dir()
+    monkeypatch.setattr(models, "SESSION_DIR", d)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", d / "_index.json")
+
+    sid = "sid-demote-fenced-carry"
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict(sid)
+    payload["composer_draft"] = {"text": "D0", "files": []}
+    store.write_session(payload)
+    (d / f"{sid}.json").write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    real_read = store.read_session
+    calls = {"n": 0}
+
+    def fail_once(sid_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sq.OperationalError("database is locked")
+        return real_read(sid_)
+
+    monkeypatch.setattr(store, "read_session", fail_once)
+
+    # Transient failure with a sidecar: fallback load succeeds, sid marked
+    # with the sidecar's D0 draft snapshot.
+    s = models.Session.load(sid)
+    assert s is not None
+    assert sid in store.unreadable_sids
+
+    # While marked, the draft autosave routes to the sidecar.
+    s.save_metadata({"composer_draft": {"text": "typed during outage", "files": []}})
+
+    # Arm the interleaved writer: the demote's probe is the next successful
+    # read_session; right after it returns, a fenced writer advances the row
+    # generation so the carry's probe-stale tokens must fail the CAS.
+    armed = {"fire": True}
+
+    def probe_then_interleave(sid_):
+        data = real_read(sid_)
+        if armed["fire"] and data is not None:
+            armed["fire"] = False
+            store.update_metadata(
+                sid_, {"title": "interleaved writer"}, **_tok(store, sid_)
+            )
+        return data
+
+    monkeypatch.setattr(store, "read_session", probe_then_interleave)
+
+    # Demote attempt: the probe is healthy, but the carry is fenced out by
+    # the interleaved writer. The demote swallows the StaleSessionWriteError,
+    # retains the mark, and the load falls back to the sidecar.
+    s2 = models.Session.load(sid)
+    assert s2 is not None
+    assert s2.composer_draft["text"] == "typed during outage"
+    assert sid in store.unreadable_sids, "fenced-out carry must retain the mark"
+    row = store.read_metadata_only(sid)
+    assert row["title"] == "interleaved writer"
+    assert row["composer_draft"]["text"] == "D0", "the fenced-out carry must not land"
+
+    # Probe healthy again (no more interleaving): the retry completes the
+    # demote, carries the sidecar draft, and keeps the interleaved title.
+    monkeypatch.setattr(store, "read_session", real_read)
+    s3 = models.Session.load(sid)
+    assert s3 is not None
+    assert sid not in store.unreadable_sids
+    assert s3.composer_draft["text"] == "typed during outage"
+    final = store.read_metadata_only(sid)
+    assert final["composer_draft"]["text"] == "typed during outage"
+    assert final["title"] == "interleaved writer"
+    # The fence stayed consistent through the failed + retried carry: the
+    # demoted session is constructed at the live generation.
+    ver = store.read_row_version(sid)
+    assert s3._persisted_generation == ver["generation"]
+
+
 def test_ephemeral_cancel_cleanup_deletes_store_row(monkeypatch):
     """DB-only ephemeral cancel cleanup must delete the row (gate finding)."""
     import api.streaming as streaming

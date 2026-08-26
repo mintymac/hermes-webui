@@ -103,6 +103,29 @@ def sql_store(request):
         s.close()
 
 
+def test_pg_legs_execute_when_dsn_set():
+    """PG-legs non-skip guarantee: when HERMES_TEST_PG_DSN is configured,
+    the Postgres backend must actually execute — a configured-but-broken
+    DSN surfaces as a FAILURE (via _pg_store), never a silent skip that
+    would let the [postgres] contract legs evaporate from a run. Direct
+    write/read guard only; skips only when the DSN is genuinely unset."""
+    dsn = os.environ.get("HERMES_TEST_PG_DSN")
+    if not dsn:
+        pytest.skip("HERMES_TEST_PG_DSN not set")
+    store = _pg_store()
+    try:
+        sid = "pg-guard"
+        store.write_session(_sample(sid))
+        loaded = store.read_session(sid)
+        assert loaded is not None and loaded["session_id"] == sid
+        store.update_metadata(sid, {"title": "pg guard updated"}, **_tok(store, sid))
+        assert store.read_session(sid)["title"] == "pg guard updated"
+        store.delete_session(sid)
+        assert store.read_session(sid) is None
+    finally:
+        store.close()
+
+
 def test_write_read_round_trip(store):
     store.write_session(_sample("c1"))
     loaded = store.read_session("c1")
