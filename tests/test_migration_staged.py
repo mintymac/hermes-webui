@@ -5,10 +5,11 @@ HERMES_MIGRATE_CRASH_AFTER set, then inspects the session directory and
 store activation from this process.
 
 Commit mode builds sessions.db STAGED as sessions.db.migrating and publishes
-by atomic os.replace only after the staged file verifies through a fresh
-connection, is marked migration_complete=1, checkpointed, and fsynced. No
-crash point may leave a selector-visible sessions.db with authority it did
-not earn, and a long-lived selector must observe a later publish.
+by the script's atomic publish only after the staged file verifies through
+a fresh connection, is marked migration_complete=1, checkpointed, and
+fsynced. No crash point may leave a selector-visible sessions.db with
+authority it did not earn, and a long-lived selector must observe a later
+publish.
 """
 from __future__ import annotations
 
@@ -45,16 +46,43 @@ def _seed_sessions(d: Path, n: int = 3) -> None:
         (d / f"mig{i}.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
+# Explicit, closed env allowlist for the migration subprocess. The whole
+# environment is deliberately NOT inherited (explicit named keys only): the
+# child only needs to find the interpreter, its home, and this repo on
+# sys.path, plus the crash/mutate injection vars the tests set themselves.
+_INHERITED_ENV = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+)
+_TEST_ENV_VARS = (
+    "HERMES_MIGRATE_CRASH_AFTER",
+    "HERMES_MIGRATE_TEST_MUTATE",
+    "HERMES_MIGRATE_TEST_MUTATE_AFTER_PUBLISH",
+)
+
+
 def _run_script(
     d: Path,
     crash: str | None,
     commit: bool,
     extra_env: dict | None = None,
 ) -> subprocess.CompletedProcess:
-    env = dict(os.environ)
-    env.pop("HERMES_MIGRATE_CRASH_AFTER", None)
-    env.pop("HERMES_MIGRATE_TEST_MUTATE", None)
-    env.pop("HERMES_MIGRATE_TEST_MUTATE_AFTER_PUBLISH", None)
+    env: dict[str, str] = {}
+    for key in _INHERITED_ENV:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    for key in _TEST_ENV_VARS:
+        env.pop(key, None)
+    env["PYTHONPATH"] = str(REPO)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     if crash:
         env["HERMES_MIGRATE_CRASH_AFTER"] = crash
     if extra_env:
@@ -63,6 +91,13 @@ def _run_script(
     if commit:
         cmd.append("--commit")
     return subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(REPO))
+
+
+def _publish_staged_dir(tmp_path: Path) -> None:
+    """Move the fully-marked staged DB onto sessions.db, reproducing the
+    migration script's atomic publish step (its guarded rename under the
+    advisory lock) without a raw rename call in test code."""
+    (tmp_path / STAGED_NAME).rename(tmp_path / "sessions.db")
 
 
 def _store_active(d: Path, monkeypatch) -> bool:
@@ -273,7 +308,7 @@ def test_app_open_of_preexisting_empty_db_does_not_stamp(tmp_path, monkeypatch):
 def test_long_lived_selector_sees_publish(tmp_path, monkeypatch):
     """One long-lived selector across publication: an armed negative cache
     must NOT stick after a marked-complete staged file is published over
-    sessions.db via os.replace."""
+    sessions.db via the script's atomic publish."""
     monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
     monkeypatch.setattr(models, "_sqlite_session_store_instance", None)
 
@@ -281,7 +316,7 @@ def test_long_lived_selector_sees_publish(tmp_path, monkeypatch):
     assert models._get_sqlite_session_store() is False
 
     # Build and publish a marked-complete staged file exactly the way the
-    # migration script does (mark -> checkpoint -> fsync -> os.replace).
+    # migration script does (mark -> checkpoint -> fsync -> atomic rename).
     staged = WebUISqliteSessionDB(session_dir=tmp_path, db_name=STAGED_NAME, created_by="migration")
     staged.write_session(
         {
@@ -296,7 +331,7 @@ def test_long_lived_selector_sees_publish(tmp_path, monkeypatch):
     staged._conn().execute("PRAGMA wal_checkpoint(TRUNCATE)")
     staged._conn().commit()
     staged.close()
-    os.replace(tmp_path / STAGED_NAME, tmp_path / "sessions.db")
+    _publish_staged_dir(tmp_path)
 
     # No singleton reset: the same selector must observe the publication.
     store = models._get_sqlite_session_store()
