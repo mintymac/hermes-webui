@@ -46,6 +46,28 @@ from __future__ import annotations
 
 from typing import Any, Protocol, Sequence
 
+# Canonical filename of the cross-process session-store cutover lock,
+# shared by the live WebUI's JSON sidecar writers and the staged
+# migration's publish window:
+#
+#   - api.models._sidecar_write_guard holds it SHARED around every JSON
+#     sidecar write (Session.save / Session.save_metadata fallback), with
+#     the store-selector re-probe inside the same hold.
+#   - scripts/migrate_sessions_to_sqlite.py holds it EXCLUSIVE across the
+#     pre-publish source-identity CAS, the atomic sessions.db publication,
+#     and sidecar retirement.
+#
+# A live sidecar save therefore cannot land inside the check→publish window:
+# it either completes before the CAS observes the file (drift → the run
+# refuses, the newer bytes stay canonical for the next run) or it blocks
+# until publication, where the re-probe routes the write into the
+# now-authoritative SQL store (cutover adoption). It deliberately lives
+# here — the dependency-free contract module — so the server and the
+# offline migration script can never drift on the name. It is a separate
+# file from .migrating.lock, which serializes whole migration runs and is
+# never taken by the live WebUI.
+CUTOVER_LOCK_NAME = ".cutover.lock"
+
 
 class SessionStore(Protocol):
     """Canonical WebUI session persistence contract."""

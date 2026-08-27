@@ -16,29 +16,39 @@ verified through a fresh connection, marked ``migration_complete=1``,
 checkpointed, fsynced, and atomically renamed over the final path. Only then
 are the original JSON files moved to ``json-backup/``.
 
-Cutover coordination:
+Cutover coordination (two locks, two jobs):
 
-- An exclusive, non-blocking cross-process lock (``<session_dir>/.migrating.lock``)
-  serializes concurrent migration runs (flock / msvcrt, mirroring
-  ``api.models._cleanup_manifest_process_lock``). The lock file is never
-  unlinked: unlinking under contention splits later acquirers across inodes.
-  Both dry-run and --commit take it so a dry-run never reports against a
-  moving target. The live WebUI does NOT take this lock; defense against a
-  live writer is the source-identity CAS below.
+- ``<session_dir>/.migrating.lock`` — an exclusive, non-blocking
+  cross-process lock (flock / msvcrt, mirroring
+  ``api.models._cleanup_manifest_process_lock``) that serializes concurrent
+  MIGRATION runs for the whole cutover. The lock file is never unlinked:
+  unlinking under contention splits later acquirers across inodes. Both
+  dry-run and --commit take it so a dry-run never reports against a moving
+  target. Live WebUI writers never touch this lock.
+- ``<session_dir>/.cutover.lock`` (api.session_store.CUTOVER_LOCK_NAME) —
+  the live-writer handoff lock. The publish window below holds it
+  EXCLUSIVE; every live JSON sidecar write (api.models._sidecar_write_guard
+  around Session.save / Session.save_metadata) holds it SHARED, with the
+  store-selector re-probe inside the same hold. This is what makes the
+  check→publish pair atomic against live writers:
+
+  * a live save that completes before the window's CAS observes the file
+    drifts it → the run refuses (exit 1) BEFORE sessions.db becomes
+    active, and the writer's newer bytes stay canonical in the sidecar
+    for the next run; or
+  * a live save that starts inside the window blocks on the shared lock
+    until publication completes, then re-routes into the now-authoritative
+    SQL store (cutover adoption of a fresh durable token) — the
+    acknowledged save is durably applied to the published generation.
+
+  Either way an acknowledged live save can never be stranded outside the
+  published authority. A crashed process on either side releases its
+  kernel lock automatically; both acquisitions are deadline-bounded so a
+  wedged counterpart refuses (exit 1) instead of hanging.
 - Each copied sidecar's exact bytes are hashed (SHA-256) at copy time. A stat
   signature would false-positive on the WebUI's temp-file + os.replace writer
   (every save swaps the inode and bumps mtime_ns even for identical content);
   the content hash gives exact-preimage semantics with no false positives.
-- Immediately before publication, every migrated sidecar is re-hashed: any
-  missing/changed file refuses the whole run (exit 1), because a drift proves
-  a live writer is serving this session dir mid-cutover — publishing a mixed
-  snapshot is precisely the lost-write hole. The staged file is retained for
-  the next run; no sidecar is moved.
-- After publication, each migrated sidecar is re-hashed again and moved to
-  ``json-backup/`` only if it is still the exact preimage; drifted files stay
-  in place as operator-visible evidence (exit 3) and are NOT auto-re-imported
-  (a force re-import would launder an arbitrary intermediate writer over a
-  fenced row, breaking the writer-token story; the SQL row is authoritative).
 - Sidecars that fail to parse or verify are skipped per-session (the staged
   rows are excised: both the sessions row AND the session_incarnations row,
   so the sid keeps its pristine absent-row first-create path) and are left
@@ -55,13 +65,21 @@ completed) — used by tests/test_migration_staged.py. ``schema`` and
 ``markers`` fire inside the store constructor (api.webui_session_sqlite
 exposes the same hook) so the pre-marker window is covered too.
 
-Test-only mutation hooks (same pattern as the crash hooks):
+Test-only mutation/pause hooks (same pattern as the crash hooks):
 ``HERMES_MIGRATE_TEST_MUTATE=<sid>`` rewrites that sidecar (byte-different,
 still valid JSON) immediately BEFORE the pre-publish CAS, and
 ``HERMES_MIGRATE_TEST_MUTATE_AFTER_PUBLISH=<sid>`` does the same immediately
 AFTER the publish ``os.replace``, before the retirement move loop. These are
-the only deterministic way to exercise the copy→CAS and CAS→move windows
-from a subprocess test.
+the deterministic way to exercise the copy→CAS and CAS→move windows for
+NON-compliant writers (direct file edits) from a subprocess test. For the
+COMPLIANT production writer (api.models Session.save / save_metadata under
+the shared cutover lock), use the pause hooks instead:
+``HERMES_MIGRATE_TEST_PAUSE_BEFORE_CAS=<file>`` pauses the run before the
+publish window acquires the cutover lock, and
+``HERMES_MIGRATE_TEST_PAUSE_AFTER_CAS=<file>`` pauses it INSIDE the window,
+immediately after the final preimage check and before ``os.replace`` — the
+exact check→publish gap — printing a flushed ``TEST-PAUSE`` marker the
+driving test can stream-read. The run resumes when the file appears.
 """
 from __future__ import annotations
 
@@ -90,6 +108,7 @@ except ImportError:  # POSIX
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from api.session_store import CUTOVER_LOCK_NAME
 from api.webui_session_sqlite import WebUISqliteSessionDB, _is_safe_session_id
 
 CRASH_EXIT = 42
@@ -170,6 +189,105 @@ def _migration_lock(session_dir: Path):
 
         print("ERROR: no cross-process lock primitive available; refusing uncoordinated cutover")
         raise SystemExit(1)
+
+
+@contextmanager
+def _publish_window_lock(session_dir: Path):
+    """EXCLUSIVE hold on the live-writer cutover lock for the publish window.
+
+    api.models._sidecar_write_guard holds this same lock SHARED around every
+    live JSON sidecar write (Session.save / Session.save_metadata), with the
+    store-selector re-probe inside the hold. Holding it exclusively across
+    the pre-publish source-identity CAS, the atomic publication, and sidecar
+    retirement closes the check→publish race the static gate flagged: a
+    live save either completes its atomic rename before the CAS observes
+    the file (drift → this run refuses with exit 1; the newer bytes stay
+    canonical in the sidecar for the next run) or blocks until publication
+    is done — where the writer's in-hold re-probe re-routes the save into
+    the now-authoritative SQL store, so the acknowledged write is durably
+    applied to the published generation.
+
+    Blocking with a deadline (HERMES_MIGRATE_PUBLISH_LOCK_TIMEOUT, default
+    120s): a wedged live writer cannot wedge the cutover forever — on
+    timeout the run refuses (exit 1, staged file retained). A crash of
+    EITHER process releases its kernel lock automatically. Same
+    primitives and fail-closed policy as _migration_lock, on a SEPARATE
+    file: .migrating.lock serializes whole migration runs and must never
+    be held across live-writer I/O, and this lock must never serialize
+    two migration runs (that is .migrating.lock's job). The lock file is
+    never unlinked (unlinking under contention splits later acquirers
+    across inodes).
+    """
+    try:
+        timeout = float(os.environ.get("HERMES_MIGRATE_PUBLISH_LOCK_TIMEOUT", "") or 120.0)
+    except ValueError:
+        timeout = 120.0
+    lock_path = session_dir / CUTOVER_LOCK_NAME
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + timeout
+    with os.fdopen(fd, "r+b", buffering=0) as lock_file:
+        if _fcntl is not None:
+            while True:
+                try:
+                    _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        print("ERROR: a live writer holds the cutover lock past the deadline")
+                        raise SystemExit(1) from None
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
+            return
+
+        if _msvcrt is not None:
+            if os.fstat(lock_file.fileno()).st_size == 0:
+                lock_file.write(b"\0")
+            while True:
+                try:
+                    lock_file.seek(0)
+                    _msvcrt.locking(  # type: ignore[attr-defined]
+                        lock_file.fileno(), _msvcrt.LK_LOCK, 1  # type: ignore[attr-defined]
+                    )
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        print("ERROR: a live writer holds the cutover lock past the deadline")
+                        raise SystemExit(1) from None
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                _msvcrt.locking(  # type: ignore[attr-defined]
+                    lock_file.fileno(), _msvcrt.LK_UNLCK, 1  # type: ignore[attr-defined]
+                )
+            return
+
+        print("ERROR: no cross-process lock primitive available; refusing uncoordinated cutover")
+        raise SystemExit(1)
+
+
+def _test_pause(env_var: str, note: str) -> None:
+    """TEST-ONLY hook: pause at a named publish-window point until the file
+    named by ``env_var`` appears (printed marker is flushed so a driving
+    test can stream-read it). Used to interleave REAL production sidecar
+    writers (api.models Session.save / save_metadata in the test process)
+    with the exact check→publish schedules the cutover protocol must close.
+    A 120s bound keeps an orphaned test from hanging CI; on timeout the run
+    refuses (exit 1) without publishing."""
+    path = os.environ.get(env_var)
+    if not path:
+        return
+    deadline = time.monotonic() + 120.0
+    print(f"TEST-PAUSE {note}; waiting for {path}", flush=True)
+    while time.monotonic() < deadline:
+        if Path(path).exists():
+            return
+        time.sleep(0.05)
+    print(f"ERROR: {env_var} timed out waiting for {path}", flush=True)
+    sys.exit(1)
 
 
 def _load_json_session(path: Path) -> tuple[dict[str, Any], bytes] | None:
@@ -350,47 +468,64 @@ def _publish(
 
     _test_mutate("HERMES_MIGRATE_TEST_MUTATE", session_dir)
 
-    # Pre-publish source-identity CAS: every migrated sidecar must still be
-    # the exact preimage that was copied. Any drift proves a live writer is
-    # serving this session dir mid-cutover — refuse the whole run rather
-    # than publish a mixed snapshot (the lost-write hole). The staged file
-    # is retained (the next run rebuilds it), sessions.db is NOT published,
-    # and no sidecar is moved. A mid-run deletion of a copied sidecar is
-    # also drift: publishing its copied row would resurrect a deleted
-    # session.
-    drifted = []
-    for sid, path, size, sha in survivors:
-        if not _matches_preimage(path, size, sha):
-            drifted.append(sid)
-            print(f"DRIFT {sid}: source changed after copy")
-    if drifted:
-        print(f"FAILURES: {len(drifted)}")
-        return 1
+    # The publish window: EXCLUSIVE hold on the live-writer cutover lock
+    # (api.models._sidecar_write_guard holds it SHARED around every live
+    # sidecar write) across the source-identity CAS, the atomic rename, and
+    # sidecar retirement. The pre-window pause lets tests interleave a real
+    # production writer that completes BEFORE the CAS (the drift leg);
+    # the post-CAS pause holds the window open for the writer that must
+    # block and then re-route into the published SQL store.
+    _test_pause("HERMES_MIGRATE_TEST_PAUSE_BEFORE_CAS", "before CAS")
+    with _publish_window_lock(session_dir):
+        # Pre-publish source-identity CAS: every migrated sidecar must still
+        # be the exact preimage that was copied, observed while no live
+        # writer can hold the shared lock — so a save that raced the copy
+        # either already drifted the file (refusal below) or is blocked on
+        # the shared lock and will land in SQL after publication. Any drift
+        # proves a live writer is serving this session dir mid-cutover —
+        # refuse the whole run rather than publish a mixed snapshot (the
+        # lost-write hole). The staged file is retained (the next run
+        # rebuilds it), sessions.db is NOT published, and no sidecar is
+        # moved. A mid-run deletion of a copied sidecar is also drift:
+        # publishing its copied row would resurrect a deleted session.
+        drifted = []
+        for sid, path, size, sha in survivors:
+            if not _matches_preimage(path, size, sha):
+                drifted.append(sid)
+                print(f"DRIFT {sid}: source changed after copy")
+        if drifted:
+            print(f"FAILURES: {len(drifted)}")
+            return 1
 
-    # Publish BEFORE moving sidecars: a crash after publication leaves a
-    # fully-populated active database with the JSON files still in place.
-    _crash_check("publish")
-    os.replace(staged_path, session_dir / db_name)
-    _fsync_dir(session_dir)
+        # Publish BEFORE moving sidecars: a crash after publication leaves a
+        # fully-populated active database with the JSON files still in place.
+        _crash_check("publish")
+        _test_pause("HERMES_MIGRATE_TEST_PAUSE_AFTER_CAS", "after CAS")
+        os.replace(staged_path, session_dir / db_name)
+        _fsync_dir(session_dir)
 
-    _test_mutate("HERMES_MIGRATE_TEST_MUTATE_AFTER_PUBLISH", session_dir)
+        _test_mutate("HERMES_MIGRATE_TEST_MUTATE_AFTER_PUBLISH", session_dir)
 
-    # Post-publish retirement CAS: move only exact preimages. A drifted
-    # sidecar stays in place (the newer bytes are preserved on disk as
-    # operator-visible evidence) and is NOT auto-re-imported over the
-    # fenced, now-authoritative SQL row.
-    backup_dir = session_dir / "json-backup"
-    backup_dir.mkdir(exist_ok=True)
-    moved = 0
-    retired_drift = []
-    for sid, path, size, sha in survivors:
-        if _matches_preimage(path, size, sha):
-            dest = backup_dir / path.name
-            shutil.move(str(path), str(dest))
-            moved += 1
-        else:
-            retired_drift.append(sid)
-            print(f"DRIFTED {sid}: not retired (source changed after publication)")
+        # Post-publish retirement CAS: move only exact preimages — still
+        # inside the window, so a compliant writer cannot interleave with
+        # the retirement loop (it either already drifted the file, caught by
+        # the checks above, or is blocked and will route into SQL). A
+        # drifted sidecar (non-compliant writer or direct file edit) stays
+        # in place (the newer bytes are preserved on disk as
+        # operator-visible evidence) and is NOT auto-re-imported over the
+        # fenced, now-authoritative SQL row.
+        backup_dir = session_dir / "json-backup"
+        backup_dir.mkdir(exist_ok=True)
+        moved = 0
+        retired_drift = []
+        for sid, path, size, sha in survivors:
+            if _matches_preimage(path, size, sha):
+                dest = backup_dir / path.name
+                shutil.move(str(path), str(dest))
+                moved += 1
+            else:
+                retired_drift.append(sid)
+                print(f"DRIFTED {sid}: not retired (source changed after publication)")
     print(f"Moved {moved} JSON files to {backup_dir}")
     # Exit 3 (distinct from 1): the database IS published and active; the
     # run's retirement contract is incomplete.
@@ -411,9 +546,10 @@ def main() -> int:
 
     # Serialize concurrent migration processes for the WHOLE cutover:
     # enumeration, copy, verify, mark, checkpoint/fsync, identity CAS,
-    # os.replace, and sidecar retirement all happen under the lock. The
-    # live WebUI does not take this lock (zero server changes) — the
-    # source-identity CAS in _publish is the live-writer defense.
+    # os.replace, and sidecar retirement all happen under the lock. Live
+    # WebUI writers never take THIS lock; they hold the separate cutover
+    # lock (see _publish_window_lock) shared around each sidecar write, so
+    # the publish window is atomic against them.
     with _migration_lock(session_dir):
         # *.json ignores dotfiles, so .migrating.lock is never mistaken for
         # a sidecar.
