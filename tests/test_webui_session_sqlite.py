@@ -1700,8 +1700,6 @@ def test_delete_route_removes_sqlite_rows_and_index_does_not_resurrect(monkeypat
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
     store.write_session(_sample_session_dict("sid-del"))
 
-    import api.routes as routes
-
     # Keep the CLI state.db out of the test; the WebUI store is under test.
     monkeypatch.setattr(models, "delete_cli_session", lambda sid: True)
 
@@ -1764,8 +1762,6 @@ def test_delete_route_handles_unmigrated_json_session_with_store_active(monkeypa
     store = sqlite_db.WebUISqliteSessionDB(session_dir=d)  # activates sessions.db
     sidecar = d / "sid-json.json"
     sidecar.write_text(json.dumps(_sample_session_dict("sid-json")), encoding="utf-8")
-
-    import api.routes as routes
 
     monkeypatch.setattr(models, "delete_cli_session", lambda sid: True)
 
@@ -2742,3 +2738,75 @@ def test_draft_route_json_fallback_ordering_for_unmigrated_session(monkeypatch):
     assert reloaded.composer_draft["text"] == "json route draft"
     assert len(reloaded.messages) == 2
 
+
+
+# ── Ordering of the persistence guards relative to the SQL fast path ──────────
+# These pin the merge resolution the reviewer asked about. Each one fails if the
+# guard/dedupe/self-heal is left below the `if store.supports_generation:` block,
+# where the fast path's early return would skip it.
+
+
+def test_sql_fast_path_persists_the_exact_replay_deduped_transcript(monkeypatch):
+    """The exact-replay dedupe is the PERSISTENCE projection, computed before the
+    backend dispatch: a SQL-backed save persists the same guarded transcript the
+    JSON writer would, and the sidebar row is built from that same array."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+
+    sid = "sid-dedupe-ordering"
+    replay = {"id": "evt-1", "timestamp": 10.0, "role": "assistant", "content": "once"}
+    s = models.Session(
+        session_id=sid,
+        title="Dedupe ordering",
+        messages=[dict(replay), dict(replay), {"role": "user", "content": "next"}],
+    )
+    s.save(touch_updated_at=False, skip_index=False)
+
+    row = store.read_session(sid)
+    assert row is not None
+    assert [m.get("content") for m in row["messages"]] == ["once", "next"]
+    # The owner keeps both copies: this is a projection, not a mutation.
+    assert len(s.messages) == 3
+    # The sidebar row must advertise the count the transcript actually holds.
+    entries = json.loads((d / "_index.json").read_text(encoding="utf-8"))
+    entry = next(e for e in entries if e.get("session_id") == sid)
+    assert entry["message_count"] == 2
+
+
+def test_sql_fast_path_refuses_non_list_messages_before_any_write(monkeypatch):
+    """The messages-must-be-a-list guard runs BEFORE the SQL fast path. Without
+    that ordering the fast path would serialize a malformed transcript straight
+    into the row, and the dedupe would have answered "not a list" with an empty
+    one instead of failing loudly."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+
+    s = models.Session(session_id="sid-list-guard", title="List guard")
+    s.messages = {"not": "a list"}
+
+    with pytest.raises(ValueError):
+        s.save(touch_updated_at=False, skip_index=True)
+    assert store.session_exists("sid-list-guard") is False
+
+
+def test_sql_fast_path_clears_the_zero_message_orphan_tombstone(monkeypatch):
+    """The #4591/#4985 self-heal must run on the SQL exit too. That path returns
+    before the JSON writer's tail, so an inline copy there would never run for a
+    migrated session and the row would stay pruned from the sidebar."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    sqlite_db.WebUISqliteSessionDB(session_dir=d)
+
+    sid = "sid-tombstone-heal"
+    models._record_webui_zero_message_orphan_tombstone(sid)
+    assert sid in models._load_webui_zero_message_orphan_tombstone()
+
+    models.Session(
+        session_id=sid,
+        title="Tombstone heal",
+        messages=[{"role": "user", "content": "hi"}],
+    ).save(touch_updated_at=False, skip_index=True)
+
+    assert sid not in models._load_webui_zero_message_orphan_tombstone()

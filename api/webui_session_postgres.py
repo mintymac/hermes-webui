@@ -323,7 +323,7 @@ class WebUIPostgresSessionDB:
             "SELECT * FROM sessions ORDER BY pinned DESC, updated_at DESC, created_at DESC"
         )
         cols = [c.name for c in cur.description]
-        return [self._row_to_metadata(dict(zip(cols, row))) for row in cur.fetchall()]
+        return [self._row_to_metadata(dict(zip(cols, row, strict=True))) for row in cur.fetchall()]
 
     def session_exists(self, sid: str) -> bool:
         if not _is_safe_session_id(sid):
@@ -350,7 +350,7 @@ class WebUIPostgresSessionDB:
         if row is None:
             return None
         cols = [c.name for c in cur.description]
-        return dict(zip(cols, row))
+        return dict(zip(cols, row, strict=True))
 
     def read_session(self, sid: str) -> dict[str, Any] | None:
         if not _is_safe_session_id(sid):
@@ -985,7 +985,7 @@ class WebUIPostgresSessionDB:
                 (sid,),
             )
         cols = [d.name if hasattr(d, "name") else d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        return [dict(zip(cols, row, strict=True)) for row in cur.fetchall()]
 
     def list_cleanup_leases(self, owner: str | None = None) -> list[dict[str, Any]]:
         """Durable retry leases recorded by failed ``lifecycle_delete`` calls."""
@@ -1002,7 +1002,7 @@ class WebUIPostgresSessionDB:
                 (owner,),
             )
         cols = [d.name if hasattr(d, "name") else d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        return [dict(zip(cols, row, strict=True)) for row in cur.fetchall()]
 
     def archive(
         self,

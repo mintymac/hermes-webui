@@ -160,7 +160,7 @@ def _migration_lock(session_dir: Path):
                 _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
             except OSError:
                 print("ERROR: another migration holds .migrating.lock")
-                raise SystemExit(1)
+                raise SystemExit(1) from None
             try:
                 yield
             finally:
@@ -177,7 +177,7 @@ def _migration_lock(session_dir: Path):
                 )
             except OSError:
                 print("ERROR: another migration holds .migrating.lock")
-                raise SystemExit(1)
+                raise SystemExit(1) from None
             try:
                 yield
             finally:
@@ -290,6 +290,32 @@ def _test_pause(env_var: str, note: str) -> None:
     sys.exit(1)
 
 
+def _load_dedicated_draft(session_dir: Path, sid: str) -> dict[str, Any] | None:
+    """Return ``sid``'s composer draft from its dedicated overlay, if present.
+
+    The composer keeps the in-flight draft in ``<session_dir>/.drafts/<sid>.json``
+    rather than in the session record (``api.models._session_draft_path``), and
+    the sidecar read paths overlay it there. The SQL read paths do not consult
+    that overlay, so the migration must carry it into the row: otherwise the
+    draft the user is typing is dropped at cutover and the orphan-draft sweep
+    later deletes the only remaining copy.
+    """
+    if not _is_safe_session_id(sid):
+        return None
+    path = session_dir / ".drafts" / f"{sid}.json"
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        print(f"WARN {sid}: unreadable dedicated draft ({e}); keeping the record's own draft")
+        return None
+    if not isinstance(payload, dict):
+        print(f"WARN {sid}: dedicated draft is not an object; keeping the record's own draft")
+        return None
+    return payload
+
+
 def _load_json_session(path: Path) -> tuple[dict[str, Any], bytes] | None:
     """Parse a sidecar; returns (data, raw_bytes) or None (already SKIP-logged)."""
     try:
@@ -307,6 +333,12 @@ def _load_json_session(path: Path) -> tuple[dict[str, Any], bytes] | None:
         return None
     if "session_id" not in data:
         data["session_id"] = sid
+    # Overlay the dedicated composer draft, mirroring Session.load's sidecar read
+    # path, so the migrated row is what a WebUI load would have produced. `raw`
+    # stays the untouched file bytes: it is the exact-preimage CAS input.
+    draft = _load_dedicated_draft(path.parent, sid)
+    if draft is not None:
+        data["composer_draft"] = draft
     return data, raw
 
 
@@ -419,6 +451,34 @@ def _matches_preimage(path: Path, size: int, sha: str) -> bool:
     return len(raw) == size and hashlib.sha256(raw).hexdigest() == sha
 
 
+def _draft_overlay_drift(
+    staged_path: Path,
+    session_dir: Path,
+    survivors: list[Snapshot],
+) -> set[str]:
+    """Sids whose dedicated draft overlay no longer matches the staged row.
+
+    ``_load_json_session`` overlays ``.drafts/<sid>.json`` into the row's
+    ``composer_draft``, but that file is not covered by any sidecar's preimage, so
+    an overlay written after the copy pass would be retired without ever being
+    imported. An overlay that exists and differs from the row is exactly that
+    case; an absent overlay is not drift (the record's own draft is the source).
+    """
+    drifted: set[str] = set()
+    tracker = WebUISqliteSessionDB(session_dir=session_dir, db_name=staged_path.name)
+    try:
+        for sid, _path, _size, _sha in survivors:
+            draft = _load_dedicated_draft(session_dir, sid)
+            if draft is None:
+                continue
+            row = tracker.read_session(sid)
+            if row is None or _canon(row.get("composer_draft")) != _canon(draft):
+                drifted.add(sid)
+    finally:
+        tracker.close()
+    return drifted
+
+
 def _test_mutate(env_var: str, session_dir: Path) -> None:
     """TEST-ONLY hook: rewrite one sidecar (byte-different, still valid JSON)
     so subprocess tests can exercise the copy→CAS and CAS→move windows."""
@@ -493,6 +553,19 @@ def _publish(
             if not _matches_preimage(path, size, sha):
                 drifted.append(sid)
                 print(f"DRIFT {sid}: source changed after copy")
+        # The composer's dedicated draft overlay is a SECOND source for the same
+        # row: the copy pass overlays ``.drafts/<sid>.json`` into
+        # ``composer_draft``, and that file is not part of any sidecar's preimage.
+        # A draft autosave (400 ms in the composer) landing between the copy pass
+        # and this window is therefore invisible to the check above, and retiring
+        # the overlay below would strand it outside the published row. Compare
+        # every overlay that exists now against the value the staged row already
+        # carries and refuse the run on drift — the live draft stays canonical on
+        # disk for the next run. The window's exclusive hold means nothing can
+        # write an overlay after this observation and before the rename.
+        for sid in sorted(_draft_overlay_drift(staged_path, session_dir, survivors)):
+            drifted.append(sid)
+            print(f"DRIFT-DRAFT {sid}: composer draft changed after copy")
         if drifted:
             print(f"FAILURES: {len(drifted)}")
             return 1
@@ -523,6 +596,15 @@ def _publish(
                 dest = backup_dir / path.name
                 shutil.move(str(path), str(dest))
                 moved += 1
+                # Retire the dedicated composer draft overlay with its owner
+                # record. The published row already carries that draft (it was
+                # overlaid during the copy and re-verified fresh), so a surviving
+                # overlay would be a second, unread draft authority. Distinct
+                # backup name: the overlay shares its own basename with the
+                # sidecar it belonged to.
+                draft_path = session_dir / ".drafts" / f"{sid}.json"
+                if draft_path.exists():
+                    shutil.move(str(draft_path), str(backup_dir / f"{sid}.draft.json"))
             else:
                 retired_drift.append(sid)
                 print(f"DRIFTED {sid}: not retired (source changed after publication)")

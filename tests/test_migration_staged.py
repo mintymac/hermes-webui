@@ -374,7 +374,7 @@ def test_migration_refuses_when_sidecar_drifts_after_copy(tmp_path, monkeypatch)
     )
     assert result.returncode == 1, result.stdout + result.stderr
     assert "DRIFT mig1" in result.stdout
-    assert f"FAILURES: 1" in result.stdout
+    assert "FAILURES: 1" in result.stdout
     assert not (tmp_path / "sessions.db").exists()
     assert not (tmp_path / "json-backup").exists()
     # The newer bytes survive in place; nothing was retired.
@@ -875,3 +875,92 @@ def test_publish_window_lock_msvcrt_branch(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         with mod._publish_window_lock(tmp_path):
             pass  # pragma: no cover
+
+
+def test_migration_carries_dedicated_composer_draft_into_the_row(tmp_path, monkeypatch):
+    """The composer's draft lives in ``.drafts/<sid>.json``, not in the sidecar,
+    and the SQL read paths never consult that overlay. So the migration has to
+    carry it into the row and retire the overlay with its owner record —
+    otherwise the user's in-flight draft vanishes at cutover and the cleanup
+    route's orphan-draft sweep later deletes the only remaining copy."""
+    _seed_sessions(tmp_path, 1)
+    drafts = tmp_path / ".drafts"
+    drafts.mkdir()
+    (drafts / "mig0.json").write_text(
+        json.dumps({"text": "half-typed thought", "files": []}), encoding="utf-8"
+    )
+
+    result = _run_script(tmp_path, None, commit=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    store = WebUISqliteSessionDB(session_dir=tmp_path)
+    try:
+        row = store.read_session("mig0")
+    finally:
+        store.close()
+    assert row is not None
+    assert row["composer_draft"] == {"text": "half-typed thought", "files": []}
+    # One authority: the overlay is gone, and its text is preserved in the backup.
+    assert not (drafts / "mig0.json").exists()
+    assert (tmp_path / "json-backup" / "mig0.draft.json").exists()
+    assert json.loads(
+        (tmp_path / "json-backup" / "mig0.draft.json").read_text(encoding="utf-8")
+    ) == {"text": "half-typed thought", "files": []}
+
+
+def test_migration_leaves_overlay_for_a_skipped_session(tmp_path, monkeypatch):
+    """A session the migration SKIPs keeps both its sidecar and its draft
+    overlay: nothing was published for it, so retiring its draft would lose the
+    only copy."""
+    (tmp_path / "bad.json").write_text("{not json", encoding="utf-8")
+    drafts = tmp_path / ".drafts"
+    drafts.mkdir()
+    (drafts / "bad.json").write_text(
+        json.dumps({"text": "keep me", "files": []}), encoding="utf-8"
+    )
+
+    result = _run_script(tmp_path, None, commit=True)
+    assert result.returncode == 1, result.stdout + result.stderr  # nothing migrated
+    assert (tmp_path / "bad.json").exists()
+    assert (drafts / "bad.json").exists()
+    assert not (tmp_path / "json-backup" / "bad.draft.json").exists()
+
+
+def test_live_draft_during_verify_refuses_publication(tmp_path, monkeypatch):
+    """A composer draft autosave is a SECOND source for the same row and is not
+    covered by any sidecar's preimage. A draft landing after the copy pass must
+    refuse the run (exit 1, nothing published, nothing retired) rather than be
+    retired into json-backup while the published row keeps the older text."""
+    _aim_models_at(tmp_path, monkeypatch)
+    _seed_sessions(tmp_path, 1)
+    drafts = tmp_path / ".drafts"
+    drafts.mkdir()
+    (drafts / "mig0.json").write_text(
+        json.dumps({"text": "at copy time", "files": []}), encoding="utf-8"
+    )
+    release = tmp_path / "release.marker"
+    proc = _popen_script(tmp_path, {"HERMES_MIGRATE_TEST_PAUSE_BEFORE_CAS": str(release)})
+    try:
+        _wait_for_pause(proc, "TEST-PAUSE before CAS")
+
+        # A REAL draft write (the composer's own writer) lands after the copy
+        # pass and before the window. It never touches the sidecar, so only the
+        # overlay check can observe it.
+        models._save_session_draft("mig0", {"text": "typed during verify", "files": []})
+
+        release.write_text("go", encoding="utf-8")
+        out = proc.communicate(timeout=60.0)[0]
+    finally:
+        if proc.poll() is None:  # pragma: no cover - failure cleanup
+            proc.kill()
+            out = proc.communicate()[0]
+    assert proc.returncode == 1, out
+    assert "DRIFT-DRAFT mig0" in out
+    assert not (tmp_path / "sessions.db").exists()
+    assert not (tmp_path / "json-backup").exists()
+    assert _store_active(tmp_path, monkeypatch) is False
+    # The newer draft is still the live overlay, not retired into the backup.
+    assert json.loads((drafts / "mig0.json").read_text(encoding="utf-8"))["text"] == (
+        "typed during verify"
+    )
+    assert (tmp_path / "mig0.json").exists()
