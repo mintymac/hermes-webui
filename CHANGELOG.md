@@ -5,6 +5,13 @@
 
 ### Added
 
+- **Kanban Scheduled column.** Scheduled tasks get their own board column, and the task editor, task detail and bulk
+  status menu can set and show the Scheduled status (the sidebar count used to show the raw key). Thanks @webtecnica.
+  (#7906, fixes #7900)
+
+- **Take a photo straight from the composer on phones and tablets.** On touch devices the Attach button now offers
+  **Take photo** (opens the camera) or **Choose files**. Desktop is unchanged. Thanks @rodboev. (#7069, fixes #6942)
+
 - **Task list in the chat (optional).** Settings > Appearance > **Show task list in chat** shows the session's to-do
   list as a collapsible strip above the conversation. Collapsed it's a single band; expanded it's capped so the
   conversation keeps most of the height, with a fade marking more items. While it's on, the workspace Todos tab is
@@ -72,6 +79,25 @@
   exactly as before. Thanks @ybai08. (#8138, fixes #8126)
 
 ### Fixed
+
+- **Composer stays above the keyboard on Android Chrome and Edge.** The page now asks Chromium browsers on Android to
+  resize the layout when the on-screen keyboard opens, the same setting Gemini, Open WebUI and LibreChat use. iPhone,
+  iPad and desktop are unchanged. Thanks @qxxaa. (#6475)
+
+- **Update status line wraps and names the latest release.** The Settings > System update line no longer runs off the
+  screen on phones and tablets (it was cut mid-word and could push **Check now** out of view); it wraps, and adds
+  "Latest tag: …" when the line doesn't already name that tag. Docker/pip installs get the same tag. Thanks
+  @lucas-albers-lz4. (#6859)
+
+- **Local providers with a saved address show as configured.** Ollama, LM Studio and other keyless self-hosted
+  providers that have an endpoint now read "N models · host:port" with a green **Configured** pill on Settings >
+  Providers, instead of "Not configured". Long LAN/Tailscale hosts wrap, and the card's status strings are translated in
+  Spanish, German and Korean. Thanks @rodboev. (#7246)
+
+- **Provider usage tiles name the right window.** On Settings > Providers, a ChatGPT account whose usage probe reports a
+  24-hour and a 5-hour window showed two tiles both called "5-hour limit", and a weekly-only window was also called
+  "5-hour limit". Tiles are now labelled by their real duration ("Usage limit" + "5-hour limit", "Weekly limit"); normal
+  accounts look the same. Thanks @mvanhorn. (#6893, fixes #6825)
 
 - **A delegated task's result is retried again after a stuck delivery.** With a current Agent, a finished delegated
   task whose delivery was claimed by a process that then died stayed pending until WebUI restarted: WebUI scheduled the
@@ -468,6 +494,10 @@
 - **Documented the gateway approval-runs API opt-in.** `docs/advanced-chat-setup.md` and `docs/docker.md` now explain how to enable and use the gateway approval-runs API. Thanks @rodboev. (#5549, #5269)
 
 ### Changed
+
+- **Open thinking cards follow the reasoning as it streams.** A reasoning card that is open while the model thinks now
+  keeps the newest text in view instead of sitting at the top. Scroll up inside the card to hold your place; scroll back
+  to the bottom to resume following. Thanks @esc247. (#7988)
 
 - **The WAL snapshot refusal test now exercises a real temporary database.** Thanks @tobenot. (#8233)
 
