@@ -1743,3 +1743,30 @@ def test_sessions_cleanup_rechecks_the_condition_under_the_session_lock(tmp_path
     assert interposed["done"] is True, "cleanup never reached the delete window"
     reloaded = models.Session.load(sid)
     assert [m.get("content") for m in reloaded.messages] == ["first message"]
+
+
+def test_metadata_draft_write_follows_the_overlay_authority(tmp_path, monkeypatch):
+    """When a sid has a .drafts overlay, every load applies it OVER the embedded
+    composer_draft. A metadata draft write that lands in the sidecar is therefore
+    shadowed by the older overlay on the next read: the autosave reports success
+    and the older typing comes back. The write must follow the read authority."""
+    models, routes, session_dir = _build_draft_env(tmp_path, monkeypatch)
+
+    sid = "sid-authority-follow"
+    models.Session(
+        session_id=sid,
+        title="Authority",
+        messages=[{"role": "user", "content": "hi"}],
+        composer_draft={"text": "older", "files": []},
+    ).save(touch_updated_at=False, skip_index=True)
+    models._save_session_draft(sid, {"text": "older", "files": []})
+
+    owner = models.get_session(sid)
+    owner.save_metadata({"composer_draft": {"text": "newer typing", "files": []}})
+
+    overlay = json.loads(
+        (session_dir / ".drafts" / f"{sid}.json").read_text(encoding="utf-8")
+    )
+    assert overlay["text"] == "newer typing"
+    models.SESSIONS.clear()
+    assert models.Session.load(sid).composer_draft["text"] == "newer typing"

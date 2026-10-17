@@ -2567,21 +2567,37 @@ class Session:
                     _live_store, fields
                 ):
                     return
-                data = json.loads(self.path.read_text(encoding="utf-8"))
-                data.update(fields)
-                tmp = self.path.with_suffix(f".tmp.{os.getpid()}.{threading.current_thread().ident}")
-                try:
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        f.write(json.dumps(data, ensure_ascii=False, indent=2))
-                        f.flush()
-                        os.fsync(f.fileno())
-                    _safe_replace(tmp, self.path)
-                except Exception:
+                # Follow the authority that READS already prefer: a sid with a
+                # dedicated .drafts overlay has it applied OVER the embedded
+                # composer_draft on every load, so writing the embedded copy here
+                # would be shadowed by an older overlay on the next read — a
+                # successful autosave that silently reverts to older typing
+                # (Greptile P1). Write the overlay instead and keep the sidecar
+                # read-modify-write for the remaining fields only.
+                _sidecar_fields = dict(fields)
+                if (
+                    "composer_draft" in _sidecar_fields
+                    and _session_draft_path(self.session_id).exists()
+                ):
+                    _save_session_draft(
+                        self.session_id, _sidecar_fields.pop("composer_draft")
+                    )
+                if _sidecar_fields:
+                    data = json.loads(self.path.read_text(encoding="utf-8"))
+                    data.update(_sidecar_fields)
+                    tmp = self.path.with_suffix(f".tmp.{os.getpid()}.{threading.current_thread().ident}")
                     try:
-                        tmp.unlink(missing_ok=True)
+                        with open(tmp, "w", encoding="utf-8") as f:
+                            f.write(json.dumps(data, ensure_ascii=False, indent=2))
+                            f.flush()
+                            os.fsync(f.fileno())
+                        _safe_replace(tmp, self.path)
                     except Exception:
-                        pass
-                    raise
+                        try:
+                            tmp.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        raise
             # Keep the in-memory object consistent with what was persisted —
             # but only after the write succeeds. Without this the JSON path
             # silently relies on the caller having pre-set every field, and a
