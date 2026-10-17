@@ -2865,3 +2865,91 @@ def test_draft_route_materializes_a_diskless_new_chat_with_sql_active(monkeypatc
     assert row is not None
     assert row["composer_draft"]["text"] == "first keystroke"
     assert not (d / f"{sid}.json").exists()
+
+
+def test_read_session_returns_one_consistent_snapshot(monkeypatch):
+    """A session load must not mix two saved states.
+
+    The metadata row and each transcript table were read in separate statements,
+    so a save committing between them produced a combination no writer made (old
+    metadata with newer messages). One read transaction pins the whole read to a
+    single snapshot."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-snapshot"))
+    writer = sqlite_db.WebUISqliteSessionDB(session_dir=d)  # separate connection
+
+    real_read_messages = store._read_messages
+    state = {"saved": False}
+
+    def read_messages_with_concurrent_save(sid):
+        if not state["saved"]:
+            state["saved"] = True
+            payload = writer.read_session(sid)
+            payload["title"] = "saved mid-read"
+            payload["messages"] = list(payload["messages"]) + [
+                {"role": "user", "content": "later"}
+            ]
+            writer.write_session(payload, force=True)
+        return real_read_messages(sid)
+
+    monkeypatch.setattr(store, "_read_messages", read_messages_with_concurrent_save)
+
+    row = store.read_session("sid-snapshot")
+
+    assert state["saved"] is True, "the concurrent save never interleaved"
+    # Both halves come from the same snapshot: the pre-save values, together.
+    assert row["title"] == "Test Session"
+    assert [m.get("content") for m in row["messages"]] == ["hello", "hi"]
+
+
+def _force_store_refresh(monkeypatch, d):
+    """Bump the db file's mtime so the selector's stamp changes (a WAL checkpoint
+    does exactly this without replacing the file)."""
+    import os
+
+    os.utime(d / "sessions.db", None)
+    return models._get_sqlite_session_store()
+
+
+def test_store_refresh_keeps_unreadable_marks_across_an_ordinary_write(monkeypatch):
+    """unreadable_sids guards drafts saved to fallback sidecars while a row was
+    unreadable. A stamp change is not always a replacement — a WAL checkpoint
+    moves size+mtime on the SAME file — so the refreshed store must inherit the
+    marks instead of dropping the draft guard."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-marked"))
+
+    active = models._get_sqlite_session_store()
+    assert active is not None and active is not False
+    active.unreadable_sids["sid-marked"] = {"composer_draft": {"text": "typed"}}
+
+    refreshed = _force_store_refresh(monkeypatch, d)
+
+    assert refreshed is not None and refreshed is not False
+    assert refreshed is not active, "the stamp change should have re-probed"
+    assert "sid-marked" in refreshed.unreadable_sids
+
+
+def test_store_replacement_does_not_carry_stale_marks(monkeypatch):
+    """The complement: a REPLACED database (a migration publish renames a new file
+    over sessions.db — new inode) starts clean, because its rows never went
+    through the outage the marks describe."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-replaced"))
+
+    active = models._get_sqlite_session_store()
+    assert active is not None and active is not False
+    active.unreadable_sids["sid-replaced"] = {"composer_draft": {"text": "typed"}}
+    # Pretend the cached instance was opened on a different file.
+    active._db_inode = 123456789
+
+    refreshed = _force_store_refresh(monkeypatch, d)
+
+    assert refreshed is not None and refreshed is not False
+    assert "sid-replaced" not in refreshed.unreadable_sids

@@ -563,25 +563,39 @@ class WebUISqliteSessionDB:
     def read_session(self, sid: str) -> dict[str, Any] | None:
         if not _is_safe_session_id(sid):
             return None
-        # One PK-indexed LEFT JOIN against the incarnation authority so the
-        # loaded content and its (generation, incarnation) writer token are a
-        # single atomic read. LEFT (not INNER): a missing authority row must
-        # never hide a session from reads — it yields incarnation=None and
-        # every write path then fails closed.
-        row = self._conn().execute(
-            "SELECT s.*, i.incarnation AS incarnation "
-            "FROM sessions s "
-            "LEFT JOIN session_incarnations i ON i.session_id = s.session_id "
-            "WHERE s.session_id = ?",
-            (sid,),
-        ).fetchone()
-        if row is None:
-            return None
-        session = self._row_to_session(dict(row))
-        session["messages"] = self._read_messages(sid)
-        session["tool_calls"] = self._read_tool_calls(sid)
-        session["context_messages"] = self._read_context_messages(sid)
-        return session
+        conn = self._conn()
+        # One read transaction = one snapshot. Without it SQLite autocommits each
+        # SELECT, so a save or clear committing between the session row and the
+        # transcript tables yields a combination no writer ever produced (old
+        # messages with new metadata, or the reverse). `in_transaction` keeps this
+        # correct when the caller already owns a write transaction.
+        started_here = not conn.in_transaction
+        if started_here:
+            conn.execute("BEGIN")
+        try:
+            # One PK-indexed LEFT JOIN against the incarnation authority so the
+            # loaded content and its (generation, incarnation) writer token are a
+            # single atomic read. LEFT (not INNER): a missing authority row must
+            # never hide a session from reads — it yields incarnation=None and
+            # every write path then fails closed.
+            row = conn.execute(
+                "SELECT s.*, i.incarnation AS incarnation "
+                "FROM sessions s "
+                "LEFT JOIN session_incarnations i ON i.session_id = s.session_id "
+                "WHERE s.session_id = ?",
+                (sid,),
+            ).fetchone()
+            if row is None:
+                return None
+            session = self._row_to_session(dict(row))
+            session["messages"] = self._read_messages(sid)
+            session["tool_calls"] = self._read_tool_calls(sid)
+            session["context_messages"] = self._read_context_messages(sid)
+            return session
+        finally:
+            if started_here:
+                # Read-only: never commit, always release the snapshot.
+                conn.execute("ROLLBACK")
 
     def session_exists(self, sid: str) -> bool:
         if not _is_safe_session_id(sid):

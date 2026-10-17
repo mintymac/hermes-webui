@@ -355,14 +355,21 @@ class WebUIPostgresSessionDB:
     def read_session(self, sid: str) -> dict[str, Any] | None:
         if not _is_safe_session_id(sid):
             return None
-        d = self._fetch_row(sid)
-        if d is None:
-            return None
-        session = self._row_to_session(d)
-        session["messages"] = self._read_json_table("messages", "message_json", sid)
-        session["tool_calls"] = self._read_json_table("tool_calls", "tool_call_json", sid)
-        session["context_messages"] = self._read_json_table("context_messages", "message_json", sid)
-        return session
+        conn = self._conn()
+        # One transaction = one snapshot (psycopg opens it on the first statement).
+        # Reading the session row and each transcript table outside a shared
+        # transaction lets a concurrent save commit in between, returning a
+        # combination no writer produced; the explicit block also ends the
+        # implicit transaction so a later read cannot serve a stale snapshot.
+        with conn:
+            d = self._fetch_row(sid)
+            if d is None:
+                return None
+            session = self._row_to_session(d)
+            session["messages"] = self._read_json_table("messages", "message_json", sid)
+            session["tool_calls"] = self._read_json_table("tool_calls", "tool_call_json", sid)
+            session["context_messages"] = self._read_json_table("context_messages", "message_json", sid)
+            return session
 
     def read_metadata_only(self, sid: str) -> dict[str, Any] | None:
         if not _is_safe_session_id(sid):

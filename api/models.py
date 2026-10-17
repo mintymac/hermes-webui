@@ -2013,6 +2013,9 @@ def _probe_sqlite_session_store(db_path: Path, stamp):
     # carries no authority until migration_complete is stamped.
     if store.is_active():
         store._selector_stamp = stamp
+        # Identity of the file this store was opened on, so a later refresh can
+        # tell an ordinary write (same inode) from a replacement (new inode).
+        store._db_inode = _db_file_inode(db_path)
         return store
     try:
         store.close()
@@ -2020,6 +2023,43 @@ def _probe_sqlite_session_store(db_path: Path, stamp):
         pass
     _sqlite_session_store_stamp = stamp
     return False
+
+
+def _db_file_inode(db_path: Path):
+    try:
+        return db_path.stat().st_ino
+    except OSError:
+        return None
+
+
+def _carry_store_recovery_marks(previous, refreshed, db_path: Path) -> None:
+    """Keep process-local unreadable marks across an ORDINARY database write.
+
+    ``unreadable_sids`` guards drafts that were saved to fallback sidecars while a
+    row was unreadable. The selector re-probes whenever the db stamp changes, and
+    a WAL checkpoint moves size and mtime without replacing the file — so the
+    refreshed instance must inherit the marks, or those drafts silently lose
+    their guard. A *replaced* file (a migration publish renames a new database
+    over sessions.db, new inode) starts clean: its rows never went through the
+    outage the marks describe.
+    """
+    try:
+        previous_inode = getattr(previous, "_db_inode", None)
+        current_inode = _db_file_inode(db_path)
+        if (
+            previous_inode is None
+            or current_inode is None
+            or previous_inode != current_inode
+        ):
+            return
+        marks = getattr(previous, "unreadable_sids", None)
+        if marks:
+            refreshed.unreadable_sids.update(marks)
+    except Exception:
+        logger.debug(
+            "Failed to carry session recovery marks across a store refresh",
+            exc_info=True,
+        )
 
 
 def _get_sqlite_session_store():
@@ -2043,6 +2083,11 @@ def _get_sqlite_session_store():
         # staged migration was published after this selector first looked):
         # re-probe rather than stick on False.
     result = _probe_sqlite_session_store(db_path, stamp)
+    if result and cached and cached is not False:
+        # A stamp change is not necessarily a replacement: a WAL checkpoint
+        # rewrites the same file. Keep the recovery marks that protect
+        # fallback-saved drafts across such a refresh.
+        _carry_store_recovery_marks(cached, result, db_path)
     _sqlite_session_store_instance = result
     return result
 
