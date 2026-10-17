@@ -7266,8 +7266,17 @@ def _migrate_compression_session_ownership(
     index_path = _models.SESSION_INDEX_FILE
     index_row_snapshot = None
     index_file_existed = False
+    # A migrated session has no JSON sidecar: its durable record is the store row,
+    # which this handoff does not rewrite, so there is no sidecar preimage to
+    # capture or restore. Only the index-row snapshot still applies. Capturing the
+    # preimage unconditionally aborted the whole continuation publish for every
+    # migrated session.
+    old_preimage = None
     try:
-        old_preimage = old_path.read_text(encoding='utf-8')
+        try:
+            old_preimage = old_path.read_text(encoding='utf-8')
+        except FileNotFoundError:
+            old_preimage = None
         with _models._INDEX_WRITE_LOCK:
             index_file_existed = index_path.exists()
             if index_file_existed:
@@ -7304,7 +7313,8 @@ def _migrate_compression_session_ownership(
                 return 0.0
 
         with _models._INDEX_WRITE_LOCK:
-            _atomic_write_text(old_path, old_preimage, encoding='utf-8')
+            if old_preimage is not None:
+                _atomic_write_text(old_path, old_preimage, encoding='utf-8')
             if not index_path.exists():
                 if not index_file_existed:
                     return
@@ -7393,6 +7403,12 @@ def _migrate_compression_session_ownership(
                 s.pre_compression_snapshot = False
                 s.pre_compression_continuation_session_id = None
                 s.parent_session_id = old_sid
+                # The continuation is a NEW durable record. Inheriting the old
+                # row writer token makes its first save fail the CAS against a
+                # row that does not exist under this sid, so clear it and let the
+                # store take the first-create path (a later load binds fresh).
+                s._persisted_generation = None
+                s._persisted_incarnation = None
                 SESSIONS[new_sid] = s
                 SESSIONS.move_to_end(new_sid)
                 _evict_sessions_over_cap()

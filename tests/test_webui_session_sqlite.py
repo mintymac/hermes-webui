@@ -3078,3 +3078,46 @@ def test_failed_delete_lease_is_retried_by_the_cleanup_sweep(monkeypatch):
     assert store.session_exists("sid-leased") is False, "the lease was never retried"
     assert store.list_cleanup_leases() == []
     assert cleanup_result.get("cleaned", 0) >= 1
+
+
+def test_compression_handoff_publishes_for_a_sidecarless_migrated_session(monkeypatch):
+    """A migrated session has no JSON sidecar, so capturing the handoff preimage
+    with old_path.read_text() aborted the whole continuation publish for every
+    migrated session. The preimage is now optional, and the continuation must not
+    inherit the old row writer token — its first save would otherwise fail the
+    CAS against a row that does not exist under the new sid."""
+    import api.routes as routes
+    import api.streaming as streaming
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    monkeypatch.setattr(streaming, "SESSION_DIR", d)
+    monkeypatch.setattr(streaming, "SESSIONS", models.SESSIONS)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+
+    old_sid, new_sid = "sid-mig-old", "sid-mig-new"
+    store.write_session(_sample_session_dict(old_sid))
+    assert not (d / f"{old_sid}.json").exists(), "fixture must be sidecar-less"
+
+    owner = models.Session.load(old_sid)
+    assert owner is not None
+    assert owner._persisted_generation is not None
+    with routes.LOCK:
+        models.SESSIONS.clear()
+        models.SESSIONS[old_sid] = owner
+    agent_lock = routes._get_session_agent_lock(old_sid)
+
+    assert streaming._migrate_compression_session_ownership(
+        owner, old_sid, new_sid, agent_lock
+    ) is True, "the handoff aborted for a sidecar-less session"
+
+    assert owner.session_id == new_sid
+    assert owner._persisted_generation is None
+    assert owner._persisted_incarnation is None
+    # The old sid keeps its snapshot row, and the continuation writes its own.
+    snapshot = store.read_session(old_sid)
+    assert snapshot is not None
+    assert snapshot.get("pre_compression_snapshot") is True
+    assert store.read_session(new_sid) is None
+    owner.save(touch_updated_at=False, skip_index=True)
+    assert store.read_session(new_sid) is not None
