@@ -17841,6 +17841,69 @@ def handle_post(handler, parsed) -> bool:
                 status=409,
             )
 
+        def _draft_sid_is_diskless(sid: str) -> bool:
+            """True when ``sid`` has no authority anywhere: no sidecar, no store row.
+
+            A brand-new chat is the only diskless sid. A migrated session has a row
+            and a JSON-lineage session has a sidecar, so neither is ever mistaken
+            for a new chat (which is what made this check sidecar-only upstream).
+            """
+            if (SESSION_DIR / f"{sid}.json").exists():
+                return False
+            try:
+                store = get_session_store()
+                if getattr(store, "persists_without_sidecar", False):
+                    return not bool(store.session_exists(sid))
+            except Exception:
+                logger.debug(
+                    "Draft owner existence check failed for %s", sid, exc_info=True
+                )
+            return True
+
+        def _publish_draft_owner_record(sid: str):
+            """Publish the small owner record for a diskless chat under ``LOCK``.
+
+            Neither ``save_metadata()`` (no row, no sidecar to fall back to) nor the
+            ``.drafts`` overlay can attach a draft to a chat that has no record yet,
+            so the first autosave of a new chat creates one exactly as upstream's
+            sidecar arm does. Returns a response to send, or None on success.
+            """
+            with LOCK:
+                if SESSIONS.get(sid) is not request_session:
+                    return j(
+                        handler,
+                        {
+                            "ok": False,
+                            "error": "Session no longer active",
+                            "session_id": sid,
+                        },
+                        status=409,
+                    )
+                if len(getattr(request_session, "messages", []) or []) != 0:
+                    return j(
+                        handler,
+                        {
+                            "ok": False,
+                            "error": "Session no longer active",
+                            "session_id": sid,
+                        },
+                        status=409,
+                    )
+                if not _draft_sid_is_diskless(sid):
+                    # An owner appeared while we were acquiring the shared lock;
+                    # proceed against it instead of republishing.
+                    return None
+                # Publish while cache state is locked so deletion cannot race
+                # first-draft ownership.
+                draft_session = copy.copy(request_session)
+                draft_session.composer_draft = {}
+                # LOCK is non-reentrant; indexing here would acquire it again.
+                draft_session.save(
+                    touch_updated_at=False,
+                    skip_index=True,
+                )
+            return None
+
         for _hop in range(_MAX_DRAFT_AUTHORITY_HOPS):
             with _get_session_agent_lock(authoritative_sid):
                 _draft_mark("acquired_lock")
@@ -17939,6 +18002,19 @@ def handle_post(handler, parsed) -> bool:
                     unchanged = True
                     saved_draft = current_draft
                 else:
+                    _draft_text = str(next_draft.get("text", "") or "")
+                    _draft_files = next_draft.get("files", []) or []
+                    _has_meaningful_draft = bool(_draft_text) or bool(_draft_files)
+                    # A brand-new chat exists ONLY in memory: no SQL row and no
+                    # sidecar, so neither save_metadata() nor the .drafts overlay
+                    # has a record to attach the draft to. Publish the small owner
+                    # record first — the step upstream's sidecar arm performs —
+                    # with the store consulted too, so a migrated session is never
+                    # mistaken for a new chat.
+                    if _has_meaningful_draft and _draft_sid_is_diskless(authoritative_sid):
+                        _owner_response = _publish_draft_owner_record(authoritative_sid)
+                        if _owner_response is not None:
+                            return _owner_response
                     _draft_store = get_session_store()
                     if getattr(_draft_store, "persists_without_sidecar", False):
                         # SQL-backed sid: the session row IS the session, so there
@@ -17955,45 +18031,6 @@ def handle_post(handler, parsed) -> bool:
                         _draft_mark("after_save")
                         saved_draft = request_session.composer_draft
                     else:
-                        _draft_text = str(next_draft.get("text", "") or "")
-                        _draft_files = next_draft.get("files", []) or []
-                        _has_meaningful_draft = bool(_draft_text) or bool(_draft_files)
-                        if not (SESSION_DIR / f"{authoritative_sid}.json").exists() and _has_meaningful_draft:
-                            with LOCK:
-                                if SESSIONS.get(authoritative_sid) is not request_session:
-                                    return j(
-                                        handler,
-                                        {
-                                            "ok": False,
-                                            "error": "Session no longer active",
-                                            "session_id": authoritative_sid,
-                                        },
-                                        status=409,
-                                    )
-                                if len(getattr(request_session, "messages", []) or []) != 0:
-                                    return j(
-                                        handler,
-                                        {
-                                            "ok": False,
-                                            "error": "Session no longer active",
-                                            "session_id": authoritative_sid,
-                                        },
-                                        status=409,
-                                    )
-                                if (SESSION_DIR / f"{authoritative_sid}.json").exists():
-                                    # Owner appeared while acquiring the shared lock; skip
-                                    # materialization and proceed with sidecar save only.
-                                    pass
-                                else:
-                                    # Publish the small owner record while cache state is locked
-                                    # so deletion cannot race first-draft ownership.
-                                    draft_session = copy.copy(request_session)
-                                    draft_session.composer_draft = {}
-                                    # LOCK is non-reentrant; indexing here would acquire it again.
-                                    draft_session.save(
-                                        touch_updated_at=False,
-                                        skip_index=True,
-                                    )
                         # Draft persistence is not conversation activity. Touching updated_at
                         # here makes the active-session external-refresh poll force-reload the
                         # current chat every few seconds while the user is typing, and that
@@ -25452,6 +25489,20 @@ def _run_residual_phases(sid: str, phases: list[str] | None = None) -> list[str]
     return remaining
 
 
+def _cleanup_session_still_qualifies(session, *, zero_only: bool) -> bool:
+    """The cleanup predicate, in one place.
+
+    Collection and the pre-delete re-check MUST agree: collection is deliberately
+    side-effect free, so only this re-read (under the session lock) can see a chat
+    that gained its first message or was renamed in between.
+    """
+    if not session or len(getattr(session, "messages", []) or []) != 0:
+        return False
+    if zero_only:
+        return True
+    return session.title == "Untitled"
+
+
 def _handle_sessions_cleanup(handler, body, zero_only=False):
     cleaned = 0
     failed = []
@@ -25501,11 +25552,7 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
             continue
         try:
             s = Session.load(p.stem)
-            if zero_only:
-                should_delete = s and len(s.messages) == 0
-            else:
-                should_delete = s and s.title == "Untitled" and len(s.messages) == 0
-            if should_delete:
+            if _cleanup_session_still_qualifies(s, zero_only=zero_only):
                 candidates.add(p.stem)
         except Exception:
             logger.debug("Failed to evaluate session file %s for cleanup", p)
@@ -25520,11 +25567,7 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
                     continue
                 try:
                     s = Session.load(_sid)
-                    if zero_only:
-                        should_delete = s and len(s.messages) == 0
-                    else:
-                        should_delete = s and s.title == "Untitled" and len(s.messages) == 0
-                    if should_delete:
+                    if _cleanup_session_still_qualifies(s, zero_only=zero_only):
                         candidates.add(_sid)
                 except Exception:
                     logger.debug("Failed to evaluate SQL-backed session %s for cleanup", _sid)
@@ -25541,63 +25584,93 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
         if _store is None:
             failed.append(_sid)
             continue
+        # Re-read the predicate under the sid's OWN lock before deleting it.
+        # Collection is deliberately side-effect free (so a failed authoritative
+        # delete leaves every representation in place for the retry owner), which
+        # means a user can send the first message or rename the chat in between —
+        # and this delete would then destroy live work. master's inline sweep held
+        # the lock across collect-and-delete; this restores that guarantee.
+        # (Session.load's self-heals take this same non-reentrant lock with a
+        # non-blocking acquire and bail, exactly as they did under master.)
+        _session_lock = _get_session_agent_lock(_sid)
+        if not _session_lock.acquire(timeout=5):
+            logger.debug("Session %s is busy; leaving it for a later cleanup", _sid)
+            continue
+        _delete_ok = False
+        _remaining: list[str] = []
+        _result: dict = {}
         try:
-            # Mirror exactly what this handler unlinked inline before: the
-            # sidecar and its .bak (index/ghost repair stays in Phase 2/3).
-            _result = _store.lifecycle_delete(
-                _sid,
-                owner="sessions_cleanup",
-                pending_phases=["sidecar", "sidecar_bak"],
-            )
-        except Exception as _exc:
-            _result = {"ok": False, "error": f"{type(_exc).__name__}: {_exc}"}
-        if _result.get("ok"):
-            with LOCK:
-                SESSIONS.pop(_sid, None)
-            _remaining = _run_residual_phases(_sid, phases=["sidecar", "sidecar_bak"])
-            if _remaining:
-                # The store delete committed but residuals remain: do NOT
-                # count this sid as cleaned — the durable phase rows carry
-                # the retry, and the janitor resumes them on the next run.
-                logger.warning(
-                    "Cleanup residuals remain for %s: %s", _sid, _remaining
+            try:
+                _current = Session.load(_sid)
+            except Exception:
+                _current = None
+            if not _cleanup_session_still_qualifies(_current, zero_only=zero_only):
+                logger.debug(
+                    "Session %s no longer qualifies for cleanup; leaving it", _sid
                 )
-                residuals[_sid] = _remaining
-                failed.append(_sid)
-            else:
-                cleaned += 1
-                phase1_removed_ids.add(_sid)
-                # The owner record and its sidecar are gone, so the composer's
-                # dedicated draft is now the only copy of the user's in-flight
-                # text. Delete it under the per-session lock, as master's inline
-                # sweep did: a writer that republishes this session during the
-                # delete must keep its newer draft instead of losing it to us.
-                _draft_lock = _get_session_agent_lock(_sid)
-                if not _draft_lock.acquire(timeout=5):
-                    logger.debug(
-                        "Session %s is busy; leaving its draft for a later sweep", _sid
-                    )
-                    draft_delete_failed = True
-                else:
-                    try:
-                        if not _delete_session_draft(_sid):
-                            draft_delete_failed = True
-                    except Exception:
-                        logger.debug(
-                            "Failed to delete draft sidecar during cleanup for %s",
-                            _sid,
-                            exc_info=True,
-                        )
-                        draft_delete_failed = True
-                    finally:
-                        _draft_lock.release()
-        else:
+                continue
+            try:
+                # Mirror exactly what this handler unlinked inline before: the
+                # sidecar and its .bak (index/ghost repair stays in Phase 2/3).
+                _result = _store.lifecycle_delete(
+                    _sid,
+                    owner="sessions_cleanup",
+                    pending_phases=["sidecar", "sidecar_bak"],
+                )
+            except Exception as _exc:
+                _result = {"ok": False, "error": f"{type(_exc).__name__}: {_exc}"}
+            if _result.get("ok"):
+                with LOCK:
+                    SESSIONS.pop(_sid, None)
+                _remaining = _run_residual_phases(
+                    _sid, phases=["sidecar", "sidecar_bak"]
+                )
+                _delete_ok = True
+        finally:
+            _session_lock.release()
+        if not _delete_ok:
             logger.warning(
                 "Cleanup delete failed for %s; retained for retry (%s)",
                 _sid,
                 _result.get("error"),
             )
             failed.append(_sid)
+            continue
+        if _remaining:
+            # The store delete committed but residuals remain: do NOT count this
+            # sid as cleaned — the durable phase rows carry the retry, and the
+            # janitor resumes them on the next run.
+            logger.warning("Cleanup residuals remain for %s: %s", _sid, _remaining)
+            residuals[_sid] = _remaining
+            failed.append(_sid)
+            continue
+        cleaned += 1
+        phase1_removed_ids.add(_sid)
+        # The owner record and its sidecar are gone, so the composer's dedicated
+        # draft is now the only copy of the user's in-flight text. Delete it under
+        # the per-session lock, as master's inline sweep did: a writer that
+        # republishes this session during the delete must keep its newer draft
+        # instead of losing it to us. Taken after the hold above — that lock is
+        # non-reentrant, so the two acquisitions must not nest.
+        _draft_lock = _get_session_agent_lock(_sid)
+        if not _draft_lock.acquire(timeout=5):
+            logger.debug(
+                "Session %s is busy; leaving its draft for a later sweep", _sid
+            )
+            draft_delete_failed = True
+        else:
+            try:
+                if not _delete_session_draft(_sid):
+                    draft_delete_failed = True
+            except Exception:
+                logger.debug(
+                    "Failed to delete draft sidecar during cleanup for %s",
+                    _sid,
+                    exc_info=True,
+                )
+                draft_delete_failed = True
+            finally:
+                _draft_lock.release()
 
     # Retry dedicated drafts whose owner sidecar was removed by an earlier
     # cleanup attempt. Coordinate with draft writes before checking ownership.

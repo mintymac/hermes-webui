@@ -114,6 +114,7 @@ _SESSION_JSON_FIELDS: set[str] = {
     "compression_anchor_details",
     "context_engine_state",
     "compression_recovery",
+    "gateway_routing",
     "gateway_routing_history",
     "anchor_scene_index",
     "pending_attachments",

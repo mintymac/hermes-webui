@@ -2810,3 +2810,58 @@ def test_sql_fast_path_clears_the_zero_message_orphan_tombstone(monkeypatch):
     ).save(touch_updated_at=False, skip_index=True)
 
     assert sid not in models._load_webui_zero_message_orphan_tombstone()
+
+
+def test_gateway_routing_round_trips_through_sqlite(monkeypatch):
+    """``gateway_routing`` is a dict on Session, and both SQL stores classify
+    columns through ``_SESSION_JSON_FIELDS``. If it is missing from that set the
+    full save hands the raw dict to the driver, which rejects it — so every
+    gateway-routed chat fails to save (and migrating one fails at write_session)."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+
+    sid = "sid-gateway-routing"
+    routing = {"lane": "gateway", "model": "gpt-4", "attempt": 1}
+    models.Session(
+        session_id=sid,
+        title="Gateway routing",
+        messages=[{"role": "user", "content": "hi"}],
+        gateway_routing=routing,
+    ).save(touch_updated_at=False, skip_index=True)
+
+    row = store.read_session(sid)
+    assert row is not None
+    assert row["gateway_routing"] == routing
+    # A model-layer reload agrees (the decode side uses the same field set).
+    assert models.Session.load(sid).gateway_routing == routing
+
+
+def test_draft_route_materializes_a_diskless_new_chat_with_sql_active(monkeypatch):
+    """A new chat lives only in memory: no SQL row and no sidecar. With
+    sessions.db active the draft route must publish the owner record first,
+    otherwise save_metadata() has neither a row nor a sidecar and its JSON
+    fallback raises FileNotFoundError — so the first autosave of a new chat
+    fails for every user once the store is active."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)  # activates sessions.db
+
+    sid = models.new_session().session_id
+    assert not (d / f"{sid}.json").exists()
+    assert store.session_exists(sid) is False
+
+    captured = _drive_draft_post(
+        monkeypatch,
+        {"session_id": sid, "text": "first keystroke", "files": []},
+    )
+
+    assert captured.get("status") == 200, captured
+    assert captured["payload"]["ok"] is True
+    assert captured["payload"]["draft"]["text"] == "first keystroke"
+    # The owner record was published into the store and carries the draft; no
+    # sidecar was created (the store is authoritative for this sid).
+    row = store.read_session(sid)
+    assert row is not None
+    assert row["composer_draft"]["text"] == "first keystroke"
+    assert not (d / f"{sid}.json").exists()
