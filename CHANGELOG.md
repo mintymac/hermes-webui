@@ -5,6 +5,8 @@
 
 ### Added
 
+- **Insights: pick an exact date range.** The period menu has a Custom range… option with Start and End date pickers (labelled, translated in all 15 languages), so usage, cost and model numbers can cover any window, not just the presets. Today is always selectable, and typing a date no longer clears the field. Thanks @silent-reader-cn. (#6970)
+
 - **Kanban Scheduled column.** Scheduled tasks get their own board column, and the task editor, task detail and bulk
   status menu can set and show the Scheduled status (the sidebar count used to show the raw key). Thanks @webtecnica.
   (#7906, fixes #7900)
@@ -79,6 +81,22 @@
   exactly as before. Thanks @ybai08. (#8138, fixes #8126)
 
 ### Fixed
+
+- **Less CPU while chats are open.** Finding a run's journal file walked every session directory on each lookup, and those lookups sit on per-poll paths (stream reconnect probes, ownership checks). With hundreds of sessions that walk took a large share of the process and slowed even `/health`. Run paths are now cached (bounded, revalidated on use), hundreds of times faster per warm lookup. Thanks @silent-reader-cn. (#8322)
+
+- **Chats on a named custom provider keep their model.** A session pinned to `@custom:<name>:<model>` could silently switch to the catalog default on another provider when the catalog was cold (the provider lives in `custom_providers`, often in a profile config). Valid models are now kept, including server-side wakeup turns, and a model that was really removed from the provider's list moves to the provider's current default, with `${VAR}` defaults expanded in the session's own profile environment. Thanks @MoBluey. (#8256)
+
+- **Scheduled Tasks mark the job that just ran.** When a job finishes in the background, the Tasks list now refreshes on its own and marks the job with a dot, and an open job's Last Output card is marked too, without collapsing output you have open. The marker uses the app's unread colour and sits in the row's gutter so titles don't shift. Thanks @martindell. (#6767)
+
+- **Failed file previews say why.** When an inline CSV, diff, PDF, HTML or Excalidraw preview can't load, the card now explains it: session expired (reload the page), no access (move the file into the workspace or check permissions), or file gone. The download link is dropped for those three cases, since it would fail too. Translated in all 15 languages. Thanks @pxxD1998. (#7254)
+
+- **Keyboard and screen-reader users can open chats from the sidebar.** Tab now reaches each conversation title, Enter or a screen reader's click opens it, and the focused row shows a focus ring. Mouse and touch behave as before: a press doesn't leave focus on the title, drags and swipes don't open a chat, and clicking elsewhere during a rename saves it. Thanks @grzezlo. (#8214)
+
+- **Error toasts stay on screen.** Twenty-one error messages (Kanban unavailable, task dependency, workspace worktree and
+  reorder failures, the MCP server toggle, checkpoint restore, copy failure) passed their type where the duration
+  goes, so the toast vanished the moment it appeared; the Kanban dispatcher result and eight worktree errors had the
+  same problem in two other shapes. `showToast` now reads a type name in that position as the type and treats 0 as the
+  default duration. (#8315)
 
 - **Session menu and Move-to-project picker stay with their row.** On tablets the sidebar menu and project picker
   opened in the top-left corner over the header; they now open at the pressed row and stay inside the screen, keep
@@ -511,6 +529,10 @@
 - **Documented the gateway approval-runs API opt-in.** `docs/advanced-chat-setup.md` and `docs/docker.md` now explain how to enable and use the gateway approval-runs API. Thanks @rodboev. (#5549, #5269)
 
 ### Changed
+
+- **Russian: the last English strings translated.** The Profiles explainer and the Transparent Stream timestamp setting now read in Russian. Thanks @RajPabnani03. (#8001)
+
+- **German: Scheduled Tasks strings translated.** The cron editor's weekdays, time fields and hints were still English in German. Thanks @solarmaster961. (#8289)
 
 - **Open thinking cards follow the reasoning as it streams.** A reasoning card that is open while the model thinks now
   keeps the newest text in view instead of sitting at the top. Scroll up inside the card to hold your place; scroll back
