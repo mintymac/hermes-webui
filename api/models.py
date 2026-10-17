@@ -8077,6 +8077,29 @@ def get_session_profile_readonly(sid):
                 raise ValueError('Invalid session profile')
             return profile
     path = SESSION_DIR / f'{sid}.json'
+    if not path.exists():
+        # A migrated session lives in a sidecarless store, whose row carries the
+        # same ownership metadata. Raising KeyError here made the profile
+        # isolation guard read every migrated session as unowned and let it
+        # through — so a request against ANOTHER profile's session got served
+        # instead of 409 session_profile_mismatch. Isolation must not depend on
+        # which storage backend happens to hold the session.
+        try:
+            store = _active_session_store_if_sidecarless()
+        except Exception:
+            store = None
+        if store is None:
+            raise KeyError(sid)
+        try:
+            meta = store.read_metadata_only(sid)
+        except Exception:
+            raise KeyError(sid) from None
+        if not isinstance(meta, dict):
+            raise KeyError(sid)
+        profile = meta.get('profile')
+        if profile is not None and not isinstance(profile, str):
+            raise ValueError('Invalid session profile')
+        return profile
     try:
         prefix = _read_metadata_json_prefix(path)
         data = json.loads(prefix) if prefix else None

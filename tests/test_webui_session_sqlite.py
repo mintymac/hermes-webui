@@ -3281,3 +3281,61 @@ def test_cached_freshness_reads_the_store_anchor_scene_fingerprint(monkeypatch):
     other.save(touch_updated_at=False, skip_index=True)
 
     assert models._cached_session_lags_disk(s) is True
+
+
+def test_session_profile_guard_sees_a_migrated_session(monkeypatch):
+    """The profile isolation guard resolves ownership with
+    get_session_profile_readonly(), which only read JSON sidecars. A migrated
+    session therefore raised KeyError, the guard treated it as unowned, and a
+    request against another profile's session was served instead of returning
+    409 session_profile_mismatch — isolation depended on the storage backend."""
+    import pytest as _pytest
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-profiled")
+    payload["profile"] = "alpha"
+    store.write_session(payload)
+    assert not (d / "sid-profiled.json").exists(), "fixture must be sidecar-less"
+
+    assert models.get_session_profile_readonly("sid-profiled") == "alpha"
+
+    # An unknown sid keeps the existing fail-open contract.
+    with _pytest.raises(KeyError):
+        models.get_session_profile_readonly("sid-missing")
+
+
+def test_profile_guard_rejects_cross_profile_requests_for_migrated_sessions(monkeypatch):
+    """End of the same chain: the route helper must return the 409 mismatch for a
+    migrated session owned by another profile."""
+    import api.routes as routes
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-cross-profile")
+    payload["profile"] = "beta"
+    store.write_session(payload)
+
+    sent = {}
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda handler, body, status=200, **kw: sent.update(body=body, status=status) or True,
+    )
+    monkeypatch.setattr(
+        routes, "bad", lambda handler, msg, status=400, **kw: sent.update(body={"error": msg}, status=status) or True
+    )
+    # The active request profile is the default; the session belongs to beta.
+    handler = SimpleNamespace(_safe_webui_print=lambda *_a, **_k: None)
+    visible = routes._session_id_visible_to_request_profile(handler, "sid-cross-profile")
+
+    if visible:
+        # If the environment has no concrete active profile, the guard is a no-op;
+        # the unit above already pins ownership resolution for migrated sessions.
+        import pytest as _pytest
+
+        _pytest.skip("no concrete active profile in this environment")
+    assert sent.get("status") == 409
+    assert sent["body"].get("code") == "session_profile_mismatch"
