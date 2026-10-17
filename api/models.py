@@ -7512,6 +7512,29 @@ def _persisted_session_meta_prefix(sid) -> dict | None:
         return None
     p = SESSION_DIR / f'{sid}.json'
     if not p.exists():
+        # No sidecar: a sidecarless store IS this session's authoritative record,
+        # and its metadata carries the same two signals this probe compares (the
+        # message count and the anchor-scene fingerprint that save() persists).
+        # Returning None here made _cached_session_lags_disk treat every
+        # scene-bearing migrated session as unverifiable and pay for a FULL
+        # metadata load on every cached read — composer autosaves included, which
+        # is most of what the store backend exists to avoid.
+        try:
+            store = _active_session_store_if_sidecarless()
+            if store:
+                meta = store.read_metadata_only(sid)
+                if isinstance(meta, dict):
+                    picked = {'message_count': meta.get('message_count')}
+                    # Carry each signal only when the record actually has it, so
+                    # "absent" keeps meaning "cannot determine" (→ full load)
+                    # rather than being misread as "no scenes".
+                    if 'anchor_scene_index' in meta:
+                        picked['anchor_scene_index'] = meta.get('anchor_scene_index')
+                    if 'updated_at' in meta:
+                        picked['updated_at'] = meta.get('updated_at')
+                    return picked
+        except Exception:
+            pass
         return None
     try:
         prefix = _read_metadata_json_prefix(p)

@@ -3241,3 +3241,43 @@ def test_delete_session_record_runs_under_the_cutover_handoff(monkeypatch):
 
     assert observed.get("held") is True, "the delete ran outside the cutover hold"
     assert store.session_exists("sid-guarded") is False
+
+
+def test_cached_freshness_reads_the_store_anchor_scene_fingerprint(monkeypatch):
+    """A SQL save persists anchor_scene_index so a cached owner can be compared
+    against disk. The freshness probe only read SIDECAR prefixes, so for a
+    migrated session it could never see that fingerprint: every cached read of a
+    scene-bearing migrated session fell through to a full metadata load —
+    composer autosaves included."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+
+    s = models.Session(
+        session_id="sid-scene-cache",
+        title="Scenes",
+        messages=[{"role": "user", "content": "hi"}],
+        anchor_activity_scenes={"scene-1": {"updated_at": 1234.0}},
+    )
+    s.save(touch_updated_at=False, skip_index=True)
+    assert not (d / "sid-scene-cache.json").exists(), "fixture must be sidecar-less"
+    assert store.read_session("sid-scene-cache")["anchor_scene_index"] == {"scene-1": 1234.0}
+
+    loads = {"n": 0}
+    real_meta_load = models.Session.load_metadata_only.__func__
+
+    def _spy(cls, *args, **kwargs):
+        loads["n"] += 1
+        return real_meta_load(cls, *args, **kwargs)
+
+    monkeypatch.setattr(models.Session, "load_metadata_only", classmethod(_spy))
+
+    assert models._cached_session_lags_disk(s) is False
+    assert loads["n"] == 0, "the cached read paid for a full metadata load"
+
+    # A scene update committed through another owner must still be detected.
+    other = models.Session.load("sid-scene-cache")
+    other.anchor_activity_scenes = {"scene-1": {"updated_at": 9999.0}}
+    other.save(touch_updated_at=False, skip_index=True)
+
+    assert models._cached_session_lags_disk(s) is True
