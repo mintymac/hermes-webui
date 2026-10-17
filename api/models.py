@@ -10989,6 +10989,26 @@ def clear_sidecar_metadata_cache() -> None:
         _SIDECAR_METADATA_CACHE.clear()
 
 
+def _ui_owned_metadata_from(webui_meta) -> dict:
+    """The UI-owned metadata fields, in the sidebar-projection shape.
+
+    ``title``/``archived``/``project_id`` belong to the WebUI layer (nothing writes
+    them to ``state.db``), so the projection must read them from whichever
+    representation owns the session: a JSON sidecar or a store row. Shared by both
+    branches of ``_state_projection_sidecar_metadata`` so they cannot drift.
+    """
+    metadata = {"title": None, "archived": None, "project_id": None}
+    if webui_meta is None:
+        return metadata
+    title = getattr(webui_meta, 'title', None)
+    if title:
+        metadata["title"] = title
+    metadata["archived"] = bool(getattr(webui_meta, 'archived', False))
+    project_id = str(getattr(webui_meta, 'project_id', None) or '').strip()
+    metadata["project_id"] = project_id or None
+    return metadata
+
+
 def _state_projection_sidecar_metadata(sid: str) -> dict:
     """Return UI-owned metadata (title + archived + project_id) for a state row.
 
@@ -11008,9 +11028,11 @@ def _state_projection_sidecar_metadata(sid: str) -> dict:
     Returns a COPY so callers can't mutate the cached dict.
 
     NOTE: this stat-gates on ``SESSION_DIR / f'{sid}.json'`` because that file is
-    ``Session.load_metadata_only``'s sole source for title+archived+project_id. If
-    that ever stops being true (metadata moves to another store), this gate would
-    short-circuit before the real source — update both together.
+    ``Session.load_metadata_only``'s source for title+archived+project_id in the
+    JSON backend. A session with NO sidecar is a migrated, store-backed session;
+    the gate cannot see a row, so that case skips the stat cache and reads the
+    store row through the same call — keep both sources in mind when adding a
+    field here.
     """
     default = {"title": None, "archived": None, "project_id": None}
     if not is_safe_session_id(sid):
@@ -11020,9 +11042,16 @@ def _state_projection_sidecar_metadata(sid: str) -> dict:
         st = p.stat()
         key = (str(p), st.st_mtime_ns, st.st_size, st.st_ctime_ns)
     except OSError:
-        # No sidecar file (the common case for a pure state.db row) or it
-        # vanished mid-build — nothing to project, and nothing worth caching.
-        return dict(default)
+        # No sidecar. Returning the empty default here dropped title/archived/
+        # project_id for every MIGRATED session, whose row in the sidecarless
+        # store is the real source for exactly those fields — archived chats
+        # reappeared as active and project assignments vanished from the sidebar.
+        # A row has no cheap stat signature, so this path caches nothing.
+        try:
+            _meta_obj = Session.load_metadata_only(sid)
+        except Exception:
+            _meta_obj = None
+        return _ui_owned_metadata_from(_meta_obj)
 
     with _SIDECAR_METADATA_CACHE_LOCK:
         hit = _SIDECAR_METADATA_CACHE.get(key)
@@ -11030,18 +11059,11 @@ def _state_projection_sidecar_metadata(sid: str) -> dict:
             _SIDECAR_METADATA_CACHE.move_to_end(key)
             return dict(hit)
 
-    metadata = dict(default)
     try:
         webui_meta = Session.load_metadata_only(sid)
     except Exception:
         webui_meta = None
-    if webui_meta:
-        title = getattr(webui_meta, 'title', None)
-        if title:
-            metadata["title"] = title
-        metadata["archived"] = bool(getattr(webui_meta, 'archived', False))
-        project_id = str(getattr(webui_meta, 'project_id', None) or '').strip()
-        metadata["project_id"] = project_id or None
+    metadata = _ui_owned_metadata_from(webui_meta)
 
     with _SIDECAR_METADATA_CACHE_LOCK:
         # Re-check under lock in case a concurrent build populated it; either

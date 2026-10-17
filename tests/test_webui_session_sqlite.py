@@ -3339,3 +3339,44 @@ def test_profile_guard_rejects_cross_profile_requests_for_migrated_sessions(monk
         _pytest.skip("no concrete active profile in this environment")
     assert sent.get("status") == 409
     assert sent["body"].get("code") == "session_profile_mismatch"
+
+
+def test_sidebar_projection_keeps_ui_metadata_for_migrated_sessions(monkeypatch):
+    """title/archived/project_id are UI-owned and never written to state.db, so the
+    sidebar projection reads them from whichever representation owns the session.
+    It stat-gated on the sidecar and returned empty defaults when there was none,
+    so every MIGRATED session lost its title, its archived flag and its project
+    assignment (archived chats reappeared as active)."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-projected")
+    payload.update({"title": "Board chat", "archived": True, "project_id": "proj-42"})
+    store.write_session(payload)
+    assert not (d / "sid-projected.json").exists(), "fixture must be sidecar-less"
+
+    meta = models._state_projection_sidecar_metadata("sid-projected")
+
+    assert meta["title"] == "Board chat"
+    assert meta["archived"] is True
+    assert meta["project_id"] == "proj-42"
+
+
+def test_sidebar_projection_still_reads_a_json_sidecar(monkeypatch):
+    """The JSON branch keeps its behavior (and the shared extractor)."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    s = models.Session(
+        session_id="sid-sidecar-projected",
+        title="Sidecar chat",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    s.archived = True
+    s.project_id = "proj-7"
+    s.save(touch_updated_at=False, skip_index=True)
+
+    meta = models._state_projection_sidecar_metadata("sid-sidecar-projected")
+
+    assert meta["title"] == "Sidecar chat"
+    assert meta["archived"] is True
+    assert meta["project_id"] == "proj-7"
