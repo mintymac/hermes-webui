@@ -2953,3 +2953,79 @@ def test_store_replacement_does_not_carry_stale_marks(monkeypatch):
 
     assert refreshed is not None and refreshed is not False
     assert "sid-replaced" not in refreshed.unreadable_sids
+
+
+def test_sql_save_persists_the_anchor_scene_index(monkeypatch):
+    """The anchor-scene fingerprint is a computed persisted field (the JSON path
+    writes it). The owned attribute is ``_anchor_scene_index`` (underscore), so a
+    SQL save used to leave the column empty — and ``_cached_session_lags_disk()``
+    then read the cached owner as an older record and reloaded the full
+    transcript on later reads, composer autosaves included."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+
+    scenes = {"scene-1": {"updated_at": 1234.0, "text": "anchor"}}
+    s = models.Session(
+        session_id="sid-anchor",
+        title="Anchor",
+        messages=[{"role": "user", "content": "hi"}],
+        anchor_activity_scenes=scenes,
+    )
+    s.save(touch_updated_at=False, skip_index=True)
+
+    expected = models._anchor_scene_index_from_records(scenes)
+    assert expected, "the fixture scenes must produce a fingerprint"
+    row = store.read_session("sid-anchor")
+    assert row is not None
+    assert row["anchor_scene_index"] == expected
+    # The owner's in-memory fingerprint tracks what it persisted, so the next
+    # cached read does not treat it as stale.
+    assert s._anchor_scene_index == expected
+    assert models._cached_session_lags_disk(s) is False
+
+
+def test_state_db_self_heal_carries_the_writer_token(monkeypatch):
+    """The state.db self-heal saves recovered messages on a separate loaded
+    object (advancing the durable generation) and copies the transcript back to
+    the cached owner. Without copying the writer token too, the cached owner's
+    count matches the record so the freshness check keeps it, but its token is
+    stale — every later save is refused StaleSessionWriteError."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+
+    payload = _sample_session_dict("sid-heal")
+    payload["active_stream_id"] = "stream-heal"
+    payload["pending_user_message"] = "pending turn"
+    payload["pending_started_at"] = 1.0  # old: past the registration grace window
+    store.write_session(payload)
+
+    owner = models.Session.load("sid-heal")
+    assert owner is not None
+    before = store.read_row_version("sid-heal")
+
+    newer = list(payload["messages"]) + [
+        {"role": "assistant", "content": "recovered from state.db", "timestamp": 2000.0}
+    ]
+    monkeypatch.setattr(models, "_active_stream_ids", lambda: set())
+    monkeypatch.setattr(
+        models,
+        "get_state_db_session_summary",
+        lambda sid, profile=None: {"message_count": 3, "last_message_at": 2000.0},
+    )
+    monkeypatch.setattr(
+        models, "get_state_db_session_messages", lambda *a, **k: list(newer)
+    )
+
+    assert models._sync_sidecar_from_state_db_if_newer(owner) is True
+
+    after = store.read_row_version("sid-heal")
+    assert after["generation"] > before["generation"], "the heal must advance the record"
+    assert owner._persisted_generation == after["generation"]
+    assert owner._persisted_incarnation == after["incarnation"]
+
+    # The owner can still write afterwards; a stale token fails this closed.
+    owner.title = "after heal"
+    owner.save(touch_updated_at=False, skip_index=True)
+    assert store.read_session("sid-heal")["title"] == "after heal"

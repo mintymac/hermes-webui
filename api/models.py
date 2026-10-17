@@ -1823,6 +1823,18 @@ def _session_payload_projection(obj, messages=None) -> dict:
     payload.setdefault("tool_calls", [])
     payload.setdefault("context_messages", [])
     payload.setdefault("anchor_activity_scenes", {})
+    # The anchor-scene fingerprint is a COMPUTED persisted field, exactly as the
+    # JSON path writes meta['anchor_scene_index']. The owned attribute is
+    # ``_anchor_scene_index`` (underscore, filtered above), so without this the
+    # store column stays empty and ``_cached_session_lags_disk()`` keeps reading
+    # the cached owner as an older record — reloading the full transcript on
+    # later reads, composer autosaves included.
+    payload.setdefault(
+        "anchor_scene_index",
+        _anchor_scene_index_from_records(
+            getattr(obj, "anchor_activity_scenes", None)
+        ),
+    )
     return payload
 
 
@@ -2631,6 +2643,13 @@ class Session:
             if touch_updated_at:
                 self.updated_at = time.time()
             payload = _session_payload_projection(self, messages=guarded_messages)
+            # Keep the in-memory fingerprint aligned with what this save persists
+            # (the JSON path rebinds self._anchor_scene_index the same way), so a
+            # later cached read does not treat this owner as an older record and
+            # reload the whole transcript.
+            _payload_scene_index = payload.get("anchor_scene_index")
+            if isinstance(_payload_scene_index, dict):
+                self._anchor_scene_index = dict(_payload_scene_index)
             # Marked-unreadable fail-closed routing: while a sid is marked, its
             # in-memory object came from the JSON sidecar, and that sidecar is
             # the authority. Writing it into SQL with force=True would launder
@@ -6819,6 +6838,18 @@ def _sync_sidecar_from_state_db_if_newer(session) -> bool:
         session.pending_attachments = []
         session.pending_started_at = None
         session.pending_user_source = None
+        # ... and the WRITER TOKEN that save just advanced, plus the recomputed
+        # scene fingerprint. Without the token the cached owner still carries the
+        # pre-save version; its message count now matches the durable record, so
+        # the freshness check keeps it, and every later save from it is refused
+        # as stale (StaleSessionWriteError) — the owner can never write again.
+        session._persisted_generation = getattr(locked, "_persisted_generation", None)
+        session._persisted_incarnation = getattr(
+            locked, "_persisted_incarnation", None
+        )
+        _locked_scene_index = getattr(locked, "_anchor_scene_index", None)
+        if isinstance(_locked_scene_index, dict):
+            session._anchor_scene_index = dict(_locked_scene_index)
         logger.info(
             "Session %s: synced sidecar from newer state.db transcript (%d -> %d messages)",
             sid,
