@@ -86,8 +86,11 @@ What `--commit` does, in order, and why each step is safe:
 5. **Restarts clean**: the next WebUI start sees an active `sessions.db` and
    serves the migrated sessions from it.
 
-Optional Postgres migration uses the same command with
-`HERMES_SESSION_STORE_PG_DSN` set and a reachable database.
+This tool migrates JSON → SQLite only. The Postgres backend is selected through
+`HERMES_SESSION_STORE_PG_DSN` (see [Postgres notes](#postgres-notes)), but there is
+no JSON → Postgres path here: provision that database with your own procedure and
+verify it against the contract tests in
+[`tests/test_session_store_contract.py`](../tests/test_session_store_contract.py).
 
 ## Mixed directories
 
@@ -115,9 +118,9 @@ Rollback is per directory, and it reverses the publish rather than a live DB:
    directory — e.g. `mv sessions.db sessions.db.rollback`. With no active
    database, the selector falls back to JSON on the next start.
 3. Restore the sidecars: move `<session_dir>/json-backup/*.json` back into
-   `<session_dir>/`. Draft overlays live in `<session_dir>/.drafts/`; the retired
-   `<session_id>.draft.json` files are already in the shape that directory
-   expects.
+   `<session_dir>/`. Draft overlays live in `<session_dir>/.drafts/`; a retired
+   `<sid>.draft.json` is the overlay for `<sid>`, so copy it in as
+   `.drafts/<sid>.json`.
 4. Start WebUI and confirm the sidebar lists your chats.
 
 Sessions that were *created* after the migration have no `json-backup/` entry.
