@@ -531,7 +531,22 @@ def _persisted_session_ids_snapshot() -> frozenset[str]:
         dir_mtime_ns = SESSION_DIR.stat().st_mtime_ns
     except Exception:
         dir_mtime_ns = None
-    cached_dir, cached_mtime_ns, cached_rev, cached_ids = _PERSISTED_SESSION_IDS_CACHE
+    # This cache is a module global, so an entry written in an older shape (three
+    # fields, before the store-revision key) can still be sitting there — tests
+    # reset it directly, and a long-lived process may have been started by code of
+    # either shape. A shape mismatch must mean "unknown", never "raise": a bare
+    # unpack here raises ValueError, which the caller's broad except turns into a
+    # full-scan fallback on EVERY poll (losing the index backfill).
+    cached = _PERSISTED_SESSION_IDS_CACHE
+    if isinstance(cached, tuple) and len(cached) == 4:
+        cached_dir, cached_mtime_ns, cached_rev, cached_ids = cached
+    else:
+        cached_dir, cached_mtime_ns, cached_rev, cached_ids = (
+            None,
+            None,
+            None,
+            frozenset(),
+        )
     # SQL-backend commits advance the store revision without moving the
     # session directory mtime, so mtime alone cannot invalidate this cache
     # once a store is active — key it on (dir, mtime, store revision).
