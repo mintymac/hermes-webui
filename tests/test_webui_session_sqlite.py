@@ -3029,3 +3029,52 @@ def test_state_db_self_heal_carries_the_writer_token(monkeypatch):
     owner.title = "after heal"
     owner.save(touch_updated_at=False, skip_index=True)
     assert store.read_session("sid-heal")["title"] == "after heal"
+
+
+def test_failed_delete_lease_is_retried_by_the_cleanup_sweep(monkeypatch):
+    """A failed authoritative delete records a durable cleanup lease, but nothing
+    read those leases: the ordinary sweep only selects EMPTY chats, so a
+    temporary/background transcript whose delete failed once stayed stored
+    forever. The sweep must retry the lease and clear it on success."""
+    import sqlite3 as _sq
+
+    import api.routes as routes
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    monkeypatch.setattr(routes, "SESSION_INDEX_FILE", d / "_index.json")
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-leased")
+    # Deliberately a COMPLETED background chat: messageful and not "Untitled", so
+    # the ordinary zero-message cleanup predicate will never select it.
+    payload["title"] = "Background finished"
+    store.write_session(payload)
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+    monkeypatch.setattr(models, "delete_cli_session", lambda sid_: True)
+
+    real_delete = store.delete_session
+
+    def _boom(sid_):
+        raise _sq.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "delete_session", _boom)
+    captured = _drive_delete_post(monkeypatch, {"session_id": "sid-leased"})
+    assert captured.get("status") == 500
+    leases = store.list_cleanup_leases()
+    assert [row["session_id"] for row in leases] == ["sid-leased"], leases
+    assert store.session_exists("sid-leased") is True
+
+    # The store recovers; the next ordinary sweep must drain the lease.
+    monkeypatch.setattr(store, "delete_session", real_delete)
+    cleanup_result = {}
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda handler, payload, **kwargs: cleanup_result.update(payload) or True,
+    )
+    handler = SimpleNamespace(_safe_webui_print=lambda *_a, **_k: None)
+    routes._handle_sessions_cleanup(handler, {}, zero_only=False)
+
+    assert store.session_exists("sid-leased") is False, "the lease was never retried"
+    assert store.list_cleanup_leases() == []
+    assert cleanup_result.get("cleaned", 0) >= 1

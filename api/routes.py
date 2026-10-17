@@ -18254,18 +18254,7 @@ def handle_post(handler, parsed) -> bool:
         # Taken under the per-session lock so the delete cannot interleave with a
         # concurrent draft write (the writer that republishes a session during
         # this window must keep its newer draft).
-        _draft_lock = _get_session_agent_lock(sid)
-        if not _draft_lock.acquire(timeout=5):
-            logger.debug("Session %s is busy; leaving its draft for the cleanup sweep", sid)
-            draft_delete_failed = True
-        else:
-            try:
-                draft_delete_failed = not bool(_delete_session_draft(sid))
-            except Exception:
-                logger.debug("Failed to delete draft sidecar for session %s", sid, exc_info=True)
-                draft_delete_failed = True
-            finally:
-                _draft_lock.release()
+        draft_delete_failed = _delete_session_draft_locked(sid)
         # The tombstone is an anti-resurrection marker whose absence
         # self-heals on index rebuild; keep it best-effort, conditioned on
         # the sidecar phase having drained (a retained sidecar must stay
@@ -25493,6 +25482,30 @@ def _run_residual_phases(sid: str, phases: list[str] | None = None) -> list[str]
     return remaining
 
 
+def _delete_session_draft_locked(sid: str) -> bool:
+    """Delete the composer's dedicated draft sidecar under the session lock.
+
+    Returns True when the draft could NOT be removed, so callers report a
+    truthful failure. Mirrors master's inline sweep: the per-session lock is held
+    so a writer that republishes the session during the delete keeps its newer
+    draft instead of losing it to us. That lock is non-reentrant, so callers must
+    not already hold it.
+    """
+    lock = _get_session_agent_lock(sid)
+    if not lock.acquire(timeout=5):
+        logger.debug("Session %s is busy; leaving its draft for a later sweep", sid)
+        return True
+    try:
+        return not bool(_delete_session_draft(sid))
+    except Exception:
+        logger.debug(
+            "Failed to delete draft sidecar for session %s", sid, exc_info=True
+        )
+        return True
+    finally:
+        lock.release()
+
+
 def _cleanup_session_still_qualifies(session, *, zero_only: bool) -> bool:
     """The cleanup predicate, in one place.
 
@@ -25544,6 +25557,63 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
             if _remaining:
                 residuals[_sid] = _remaining
                 failed.append(_sid)
+
+    # Pre-pass: retry authoritative deletes that FAILED. lifecycle_delete records
+    # a durable cleanup_lease when the store delete fails (and clears it on
+    # success), but nothing ever read those leases, so a transient failure
+    # stranded a temporary or background transcript indefinitely — the ordinary
+    # scan below only selects EMPTY chats, so it never revisited them. Each sweep
+    # retries every lease once: success clears the lease and records the residual
+    # phases drained here; failure bumps `attempts` for the next run.
+    if _store is not None and getattr(_store, "supports_generation", False):
+        try:
+            _leases = _store.list_cleanup_leases()
+        except Exception:
+            logger.debug("Cleanup lease ledger unavailable", exc_info=True)
+            _leases = []
+        for _lease in _leases:
+            _sid = str(_lease.get("session_id") or "")
+            if not _sid or not is_safe_session_id(_sid):
+                continue
+            _lease_lock = _get_session_agent_lock(_sid)
+            if not _lease_lock.acquire(timeout=5):
+                logger.debug("Session %s is busy; leaving its delete lease", _sid)
+                failed.append(_sid)
+                continue
+            _lease_remaining: list[str] = []
+            try:
+                try:
+                    _retry = _store.lifecycle_delete(
+                        _sid,
+                        owner=str(_lease.get("owner") or "lease_retry"),
+                        pending_phases=_residual_phase_set(
+                            _sid, is_messaging=_is_messaging_session_id(_sid)
+                        ),
+                    )
+                except Exception as _exc:
+                    _retry = {"ok": False, "error": f"{type(_exc).__name__}: {_exc}"}
+                if not _retry.get("ok"):
+                    logger.warning(
+                        "Cleanup lease retry failed for %s (attempt %s): %s",
+                        _sid,
+                        _lease.get("attempts"),
+                        _retry.get("error"),
+                    )
+                    failed.append(_sid)
+                    continue
+                with LOCK:
+                    SESSIONS.pop(_sid, None)
+                _lease_remaining = _run_residual_phases(_sid)
+            finally:
+                _lease_lock.release()
+            if _lease_remaining:
+                residuals[_sid] = _lease_remaining
+                failed.append(_sid)
+                continue
+            cleaned += 1
+            phase1_removed_ids.add(_sid)
+            if _delete_session_draft_locked(_sid):
+                draft_delete_failed = True
 
     # Phase 1: collect candidate sids (JSON sidecars + SQL-backed rows) and
     # evaluate the Untitled/zero-message predicate. Collection is
@@ -25656,25 +25726,8 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
         # republishes this session during the delete must keep its newer draft
         # instead of losing it to us. Taken after the hold above — that lock is
         # non-reentrant, so the two acquisitions must not nest.
-        _draft_lock = _get_session_agent_lock(_sid)
-        if not _draft_lock.acquire(timeout=5):
-            logger.debug(
-                "Session %s is busy; leaving its draft for a later sweep", _sid
-            )
+        if _delete_session_draft_locked(_sid):
             draft_delete_failed = True
-        else:
-            try:
-                if not _delete_session_draft(_sid):
-                    draft_delete_failed = True
-            except Exception:
-                logger.debug(
-                    "Failed to delete draft sidecar during cleanup for %s",
-                    _sid,
-                    exc_info=True,
-                )
-                draft_delete_failed = True
-            finally:
-                _draft_lock.release()
 
     # Retry dedicated drafts whose owner sidecar was removed by an earlier
     # cleanup attempt. Coordinate with draft writes before checking ownership.
