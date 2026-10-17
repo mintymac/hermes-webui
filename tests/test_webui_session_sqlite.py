@@ -3121,3 +3121,123 @@ def test_compression_handoff_publishes_for_a_sidecarless_migrated_session(monkey
     assert store.read_session(new_sid) is None
     owner.save(touch_updated_at=False, skip_index=True)
     assert store.read_session(new_sid) is not None
+
+
+def test_cleanup_lease_retry_rechecks_the_condition_and_cancels(monkeypatch):
+    """A sessions_cleanup lease encodes a CONDITIONAL delete (the chat qualified
+    as empty/Untitled when selected). If the user sends the first message before
+    the retry, the sweep must cancel the lease instead of deleting live work."""
+    import sqlite3 as _sq
+
+    import api.routes as routes
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    monkeypatch.setattr(routes, "SESSION_INDEX_FILE", d / "_index.json")
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    payload = _sample_session_dict("sid-conditional")
+    payload["title"] = "Untitled"
+    payload["messages"] = []
+    store.write_session(payload)
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+    monkeypatch.setattr(models, "delete_cli_session", lambda sid_: True)
+
+    real_delete = store.delete_session
+
+    def _boom(sid_):
+        raise _sq.OperationalError("database is locked")
+
+    def _sweep():
+        monkeypatch.setattr(
+            routes, "j", lambda handler, result, **kwargs: True
+        )
+        routes._handle_sessions_cleanup(
+            SimpleNamespace(_safe_webui_print=lambda *_a, **_k: None),
+            {},
+            zero_only=False,
+        )
+
+    # A sweep whose delete fails records a cleanup-owned lease.
+    monkeypatch.setattr(store, "delete_session", _boom)
+    _sweep()
+    assert [row["session_id"] for row in store.list_cleanup_leases()] == [
+        "sid-conditional"
+    ]
+
+    # The user sends the first message before the next sweep.
+    monkeypatch.setattr(store, "delete_session", real_delete)
+    live = store.read_session("sid-conditional")
+    live["messages"] = [{"role": "user", "content": "first message"}]
+    store.write_session(live, force=True)
+
+    _sweep()
+
+    assert store.session_exists("sid-conditional") is True, "the live chat was deleted"
+    assert store.list_cleanup_leases() == []
+
+
+def test_workspace_repair_uses_the_fallback_store_for_a_json_only_session(monkeypatch):
+    """sessions.db active + a session that was never migrated: Session.load serves
+    its sidecar, so the repair must target that fallback instead of failing closed
+    on the SQL store (which turned a valid chat into a 500 from /api/list)."""
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-sql-present"))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    sid = "sid-json-only"
+    s = models.Session(
+        session_id=sid,
+        title="JSON only",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    s.path.write_text(json.dumps(s.__dict__, ensure_ascii=False, indent=2), encoding="utf-8")
+    models.SESSIONS.clear()
+
+    loaded = models.Session.load(sid)
+    assert loaded is not None
+    assert store.session_exists(sid) is False, "fixture must not have a SQL row"
+
+    models.persist_recovered_workspace_binding(loaded, "/tmp/recovered-workspace")
+
+    models.SESSIONS.clear()
+    assert models.Session.load(sid).workspace == "/tmp/recovered-workspace"
+
+
+def test_delete_session_record_runs_under_the_cutover_handoff(monkeypatch):
+    """A migration publish must not land between store selection and the
+    authoritative delete: it can rename a new database over sessions.db after the
+    final source check, reporting a delete the published database contradicts."""
+    import contextlib
+
+    d = _tmp_session_dir()
+    _patch_route_state(monkeypatch, d)
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample_session_dict("sid-guarded"))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    state = {"held": False}
+
+    @contextlib.contextmanager
+    def _tracked_guard():
+        state["held"] = True
+        try:
+            yield
+        finally:
+            state["held"] = False
+
+    observed = {}
+    real_delete = store.lifecycle_delete
+
+    def _tracked_delete(sid, **kwargs):
+        observed["held"] = state["held"]
+        return real_delete(sid, **kwargs)
+
+    monkeypatch.setattr(models, "_sidecar_write_guard", _tracked_guard)
+    monkeypatch.setattr(store, "lifecycle_delete", _tracked_delete)
+
+    models.delete_session_record("sid-guarded", owner="delete_route")
+
+    assert observed.get("held") is True, "the delete ran outside the cutover hold"
+    assert store.session_exists("sid-guarded") is False

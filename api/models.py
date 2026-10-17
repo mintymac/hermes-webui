@@ -1971,6 +1971,17 @@ def get_session_store():
     store = _get_sqlite_session_store()
     if store:
         return store
+    return _json_session_store()
+
+
+def _json_session_store():
+    """The JSON sidecar store.
+
+    This is the backend a session resolves to when no SQL store holds a row for
+    it (an unmigrated session in a mixed directory). Callers that must write the
+    representation ``Session.load`` would read — rather than "the selected store"
+    — use this to target the fallback explicitly.
+    """
     from api.webui_session_db import WebUIJsonSessionDB
 
     return WebUIJsonSessionDB(session_dir=SESSION_DIR)
@@ -2008,9 +2019,17 @@ def delete_session_record(sid: str, *, owner: str = "delete_route", pending_phas
     -cleanup phase names recorded in the same transaction as the delete
     (SQL backends; accepted and ignored by the JSON backend).
     """
-    result = get_session_store().lifecycle_delete(
-        sid, owner=owner, pending_phases=pending_phases
-    )
+    # Cutover protocol: pick the store INSIDE the shared cutover hold and finish
+    # the authoritative delete before releasing it. The migration holds this same
+    # lock exclusively across its source-identity CAS, publication and sidecar
+    # retirement, so without this a delete can select the JSON store and unlink a
+    # copied sidecar AFTER the final source check but BEFORE sessions.db is
+    # published — reporting success while the published database still contains
+    # the conversation.
+    with _sidecar_write_guard():
+        result = get_session_store().lifecycle_delete(
+            sid, owner=owner, pending_phases=pending_phases
+        )
     if not result.get("ok"):
         raise RuntimeError(
             f"lifecycle_delete failed for session {sid}: {result.get('error')}"
@@ -8760,8 +8779,11 @@ def persist_recovered_workspace_binding(
     ``session_exists`` → ``read_metadata_only`` → ``update_metadata``.
     Sessions the store does not hold fail closed so recovery cannot
     resurrect a concurrently deleted session — and a leftover sidecar of a
-    migrated (SQL-owned) session is stale and never patched. The
-    per-session mutation lock keeps compare-and-replace ordered with other
+    migrated (SQL-owned) session is stale and never patched. A sid the
+    selected SQL store does not hold but the sidecar store does is an
+    UNMIGRATED session — the same representation ``Session.load`` serves —
+    so the repair targets that fallback instead of failing the chat.
+    The per-session mutation lock keeps compare-and-replace ordered with other
     compliant session writers.
     """
     sid = str(getattr(session, "session_id", "") or "").strip()
@@ -8787,12 +8809,24 @@ def persist_recovered_workspace_binding(
         with _sidecar_write_guard():
             store = get_session_store()
             if not store.session_exists(sid):
-                # Recovery only repairs an existing persisted session. Creating
-                # state here can resurrect a session that was deleted after the
-                # recovery decision but before this lock was acquired.
-                raise WorkspaceBindingPersistenceError(
-                    "Failed to persist recovered workspace: session sidecar is missing"
-                )
+                # Mixed store: sessions.db is active but this session was never
+                # migrated, so Session.load serves its JSON sidecar. Target that
+                # fallback representation instead of failing closed on a SQL store
+                # that has no row for the sid (which turned a valid chat with a
+                # missing workspace into a 500 from /api/list). A sid present in
+                # NEITHER representation still fails closed: recovery must not
+                # resurrect a session that was deleted after the recovery decision
+                # but before this lock was acquired.
+                _fallback_store = _json_session_store()
+                try:
+                    _fallback_exists = _fallback_store.session_exists(sid)
+                except Exception:
+                    _fallback_exists = False
+                if not _fallback_exists:
+                    raise WorkspaceBindingPersistenceError(
+                        "Failed to persist recovered workspace: session sidecar is missing"
+                    )
+                store = _fallback_store
             try:
                 meta = store.read_metadata_only(sid) or {}
             except Exception as exc:

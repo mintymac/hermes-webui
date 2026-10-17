@@ -1011,6 +1011,16 @@ class WebUIPostgresSessionDB:
         cols = [d.name if hasattr(d, "name") else d[0] for d in cur.description]
         return [dict(zip(cols, row, strict=True)) for row in cur.fetchall()]
 
+    def clear_cleanup_lease(self, sid: str) -> bool:
+        """Drop a durable retry lease; True when a row was removed."""
+        conn = self._conn()
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM cleanup_leases WHERE session_id = %s", (sid,)
+            )
+            removed = cur.rowcount
+        return bool(removed)
+
     def archive(
         self,
         sid: str,

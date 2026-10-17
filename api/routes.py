@@ -26053,6 +26053,7 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
             _sid = str(_lease.get("session_id") or "")
             if not _sid or not is_safe_session_id(_sid):
                 continue
+            _lease_owner = str(_lease.get("owner") or "lease_retry")
             _lease_lock = _get_session_agent_lock(_sid)
             if not _lease_lock.acquire(timeout=5):
                 logger.debug("Session %s is busy; leaving its delete lease", _sid)
@@ -26060,14 +26061,44 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
                 continue
             _lease_remaining: list[str] = []
             try:
+                if _lease_owner == "sessions_cleanup":
+                    # The sweep only ever requested this delete CONDITIONALLY: the
+                    # chat qualified as empty/Untitled when it was selected. A user
+                    # can send the first message or rename it between the failed
+                    # attempt and this retry, so re-read the condition under the
+                    # lock and CANCEL the lease rather than deleting live work.
+                    try:
+                        _current = Session.load(_sid)
+                    except Exception:
+                        _current = None
+                    if not _cleanup_session_still_qualifies(
+                        _current, zero_only=zero_only
+                    ):
+                        try:
+                            _store.clear_cleanup_lease(_sid)
+                        except Exception:
+                            logger.debug(
+                                "Could not cancel stale cleanup lease for %s",
+                                _sid,
+                                exc_info=True,
+                            )
+                        logger.debug(
+                            "Cleanup lease for %s no longer qualifies; cancelled",
+                            _sid,
+                        )
+                        continue
                 try:
-                    _retry = _store.lifecycle_delete(
-                        _sid,
-                        owner=str(_lease.get("owner") or "lease_retry"),
-                        pending_phases=_residual_phase_set(
-                            _sid, is_messaging=_is_messaging_session_id(_sid)
-                        ),
-                    )
+                    # Same cutover handoff as delete_session_record: a migration
+                    # publish must not land between store selection and the
+                    # authoritative delete.
+                    with _sidecar_write_guard():
+                        _retry = _store.lifecycle_delete(
+                            _sid,
+                            owner=_lease_owner,
+                            pending_phases=_residual_phase_set(
+                                _sid, is_messaging=_is_messaging_session_id(_sid)
+                            ),
+                        )
                 except Exception as _exc:
                     _retry = {"ok": False, "error": f"{type(_exc).__name__}: {_exc}"}
                 if not _retry.get("ok"):
@@ -26164,11 +26195,14 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
             try:
                 # Mirror exactly what this handler unlinked inline before: the
                 # sidecar and its .bak (index/ghost repair stays in Phase 2/3).
-                _result = _store.lifecycle_delete(
-                    _sid,
-                    owner="sessions_cleanup",
-                    pending_phases=["sidecar", "sidecar_bak"],
-                )
+                # Under the cutover handoff so a migration publish cannot land
+                # between the store selection above and this authoritative delete.
+                with _sidecar_write_guard():
+                    _result = _store.lifecycle_delete(
+                        _sid,
+                        owner="sessions_cleanup",
+                        pending_phases=["sidecar", "sidecar_bak"],
+                    )
             except Exception as _exc:
                 _result = {"ok": False, "error": f"{type(_exc).__name__}: {_exc}"}
             if _result.get("ok"):

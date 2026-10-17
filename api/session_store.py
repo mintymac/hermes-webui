@@ -258,6 +258,26 @@ class SessionStore(Protocol):
         returns []."""
         ...
 
+    def list_cleanup_leases(self, owner: str | None = None) -> list[dict[str, Any]]:
+        """Durable retry leases recorded by failed ``lifecycle_delete`` calls.
+
+        Each row carries ``session_id``, ``owner``, ``error``, ``updated_at``
+        and ``attempts``. A janitor retries them; a lease whose owner is a
+        CONDITIONAL sweep (``sessions_cleanup`` selected the chat as empty /
+        Untitled) must be re-qualified before the retry, never retried
+        blindly. SQL-only; the JSON backend has no ledger.
+        """
+        ...
+
+    def clear_cleanup_lease(self, sid: str) -> bool:
+        """Drop any durable retry lease for ``sid``; True when one was removed.
+
+        Used to CANCEL a lease that no longer applies (a cleanup-owned lease
+        whose chat gained its first message or was renamed). The JSON backend
+        has no ledger and returns False.
+        """
+        ...
+
     def archive(
         self,
         sid: str,

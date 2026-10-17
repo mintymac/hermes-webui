@@ -1101,6 +1101,16 @@ class WebUISqliteSessionDB:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def clear_cleanup_lease(self, sid: str) -> bool:
+        """Drop a durable retry lease; True when a row was removed."""
+        conn = self._conn()
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM cleanup_leases WHERE session_id = ?", (sid,)
+            )
+            removed = cur.rowcount
+        return bool(removed)
+
     def archive(
         self,
         sid: str,

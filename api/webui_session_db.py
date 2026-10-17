@@ -257,6 +257,14 @@ class WebUIJsonSessionDB:
         """No durable phase ledger on the JSON backend; always empty."""
         return []
 
+    def list_cleanup_leases(self, owner: str | None = None) -> list[dict[str, Any]]:
+        """No durable lease ledger on the JSON backend; always empty."""
+        return []
+
+    def clear_cleanup_lease(self, sid: str) -> bool:
+        """No-op: the JSON backend has no lease ledger."""
+        return False
+
     def get_revision(self) -> int:
         """JSON freshness signal: the session directory mtime in ns.
 
