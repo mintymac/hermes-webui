@@ -370,7 +370,14 @@ class WebUIJsonSessionDB:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp, path)
+            # Publish through master's sidecar writer, not a bare os.replace: it
+            # records the write generation either side of the rename, which is how
+            # a concurrent cold load notices that the file changed under it
+            # (_sidecar_write_generation). A raw replace makes this adapter's
+            # writes invisible to that freshness check.
+            models._replace_session_sidecar(
+                tmp, path, str(data.get("session_id") or path.stem)
+            )
         finally:
             try:
                 tmp.unlink(missing_ok=True)

@@ -8671,55 +8671,62 @@ def persist_recovered_workspace_binding(
     expected = str(expected_value or "")
     lock = _get_session_agent_lock(sid)
     with lock:
-        store = get_session_store()
-        if not store.session_exists(sid):
-            # Recovery only repairs an existing persisted session. Creating
-            # state here can resurrect a session that was deleted after the
-            # recovery decision but before this lock was acquired.
-            raise WorkspaceBindingPersistenceError(
-                "Failed to persist recovered workspace: session sidecar is missing"
-            )
-        try:
-            meta = store.read_metadata_only(sid) or {}
-        except Exception as exc:
-            raise WorkspaceBindingPersistenceError(
-                "Failed to persist recovered workspace: unreadable session record"
-            ) from exc
-        current = str(meta.get("workspace") or "")
-        _new_generation = None
-        _new_incarnation = None
-        if current != resolved:
-            if current != expected:
+        # Cutover handoff: select the store INSIDE the shared cutover hold and
+        # finish the compare-and-replace before releasing it. Otherwise a staged
+        # migration can publish between "this sid is JSON-owned" and the JSON
+        # adapter's sidecar replace, and the acknowledged repair lands in a file
+        # the published SQL row ignores — the same check->publish window
+        # Session.save()/save_metadata() already close.
+        with _sidecar_write_guard():
+            store = get_session_store()
+            if not store.session_exists(sid):
+                # Recovery only repairs an existing persisted session. Creating
+                # state here can resurrect a session that was deleted after the
+                # recovery decision but before this lock was acquired.
                 raise WorkspaceBindingPersistenceError(
-                    "Failed to persist recovered workspace: session workspace changed"
+                    "Failed to persist recovered workspace: session sidecar is missing"
                 )
-            # Fence the compare-and-replace with the durable
-            # (generation, incarnation) token just read: an interleaved
-            # writer between the read and this write raises (wrapped below)
-            # instead of being silently clobbered. The JSON sidecar store
-            # carries no durable version, so no token is passed there
-            # (last-writer-wins, unchanged).
-            _token_kwargs = {}
-            if meta.get("generation") is not None and meta.get("incarnation") is not None:
-                _token_kwargs = {
-                    "expected_generation": int(meta["generation"]),
-                    "expected_incarnation": int(meta["incarnation"]),
-                }
             try:
-                _meta_result = store.update_metadata(
-                    sid, {"workspace": resolved}, **_token_kwargs
-                )
+                meta = store.read_metadata_only(sid) or {}
             except Exception as exc:
                 raise WorkspaceBindingPersistenceError(
-                    "Failed to persist recovered workspace"
+                    "Failed to persist recovered workspace: unreadable session record"
                 ) from exc
-            # update_metadata moves the generation fence on SQL backends:
-            # reseat the persisted lineage on every in-memory copy of this
-            # session so a later full save() still passes the CAS.
-            if isinstance(_meta_result, dict) and _meta_result.get("generation") is not None:
-                _new_generation = int(_meta_result["generation"])
-            if isinstance(_meta_result, dict) and _meta_result.get("incarnation") is not None:
-                _new_incarnation = int(_meta_result["incarnation"])
+            current = str(meta.get("workspace") or "")
+            _new_generation = None
+            _new_incarnation = None
+            if current != resolved:
+                if current != expected:
+                    raise WorkspaceBindingPersistenceError(
+                        "Failed to persist recovered workspace: session workspace changed"
+                    )
+                # Fence the compare-and-replace with the durable
+                # (generation, incarnation) token just read: an interleaved
+                # writer between the read and this write raises (wrapped below)
+                # instead of being silently clobbered. The JSON sidecar store
+                # carries no durable version, so no token is passed there
+                # (last-writer-wins, unchanged).
+                _token_kwargs = {}
+                if meta.get("generation") is not None and meta.get("incarnation") is not None:
+                    _token_kwargs = {
+                        "expected_generation": int(meta["generation"]),
+                        "expected_incarnation": int(meta["incarnation"]),
+                    }
+                try:
+                    _meta_result = store.update_metadata(
+                        sid, {"workspace": resolved}, **_token_kwargs
+                    )
+                except Exception as exc:
+                    raise WorkspaceBindingPersistenceError(
+                        "Failed to persist recovered workspace"
+                    ) from exc
+                # update_metadata moves the generation fence on SQL backends:
+                # reseat the persisted lineage on every in-memory copy of this
+                # session so a later full save() still passes the CAS.
+                if isinstance(_meta_result, dict) and _meta_result.get("generation") is not None:
+                    _new_generation = int(_meta_result["generation"])
+                if isinstance(_meta_result, dict) and _meta_result.get("incarnation") is not None:
+                    _new_incarnation = int(_meta_result["incarnation"])
 
         session.workspace = resolved
         if _new_generation is not None:
