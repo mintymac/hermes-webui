@@ -183,3 +183,71 @@ def test_mixed_directory_resolves_each_session_independently(monkeypatch):
     assert models.Session.load("sid-json").title == "From JSON"
     listed = {row["session_id"] for row in models.all_sessions()}
     assert {"sid-sql", "sid-json"} <= listed
+
+
+def _drive_delete(monkeypatch, sid):
+    """POST /api/session/delete through routes.handle_post, responders captured."""
+    from types import SimpleNamespace
+
+    import api.routes as routes
+
+    captured = {}
+    monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
+    monkeypatch.setattr(routes, "read_body", lambda handler: {"session_id": sid})
+    monkeypatch.setattr(
+        routes,
+        "bad",
+        lambda handler, msg, status=400, **kw: captured.update(error=msg, status=status)
+        or True,
+    )
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda handler, payload, status=200, **kw: captured.update(
+            payload=payload, status=status
+        )
+        or True,
+    )
+    handler = SimpleNamespace(command="POST", _safe_webui_print=lambda *_a, **_k: None)
+    assert routes.handle_post(
+        handler, SimpleNamespace(path="/api/session/delete")
+    ) is True
+    return captured
+
+
+def test_delete_route_clears_a_migrated_session_and_its_residuals(monkeypatch):
+    """A migrated session has no sidecar, but its delete must still clear the
+    residuals that DO exist (attachments, the .bak snapshot) and leave no durable
+    retry lease or cleanup-phase row behind. This is the delete path a migrated
+    install actually exercises."""
+    import api.routes as routes
+    import api.turn_journal as turn_journal
+    import api.upload as upload
+
+    d = _tmp_session_dir()
+    _patch_state(monkeypatch, d)
+    monkeypatch.setattr(routes, "SESSION_INDEX_FILE", d / "_index.json")
+    monkeypatch.setattr(models, "delete_cli_session", lambda sid_: True)
+    monkeypatch.setattr(upload, "_session_attachment_dir", lambda sid: d / "attachments" / sid)
+    monkeypatch.setattr(turn_journal, "_default_session_dir", lambda: d)
+
+    store = sqlite_db.WebUISqliteSessionDB(session_dir=d)
+    store.write_session(_sample("sid-mig-del"))
+    monkeypatch.setattr(models, "_sqlite_session_store_instance", store)
+
+    attachments = d / "attachments" / "sid-mig-del"
+    attachments.mkdir(parents=True)
+    (attachments / "note.txt").write_text("payload", encoding="utf-8")
+    backup = d / "sid-mig-del.json.bak"
+    backup.write_text("{}", encoding="utf-8")
+    assert not (d / "sid-mig-del.json").exists()
+
+    captured = _drive_delete(monkeypatch, "sid-mig-del")
+
+    assert captured.get("status") == 200, captured
+    assert captured.get("payload", {}).get("ok") is True
+    assert store.session_exists("sid-mig-del") is False
+    assert not attachments.exists(), "attachment dir survived the delete"
+    assert not backup.exists(), "the .bak snapshot survived the delete"
+    assert store.list_cleanup_leases() == []
+    assert store.list_cleanup_phases() == []
